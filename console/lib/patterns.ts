@@ -51,7 +51,7 @@ export const PATTERNS: Pattern[] = [
     rightPanel: "connection-guide",
     buildStatus: "done",
     hideCta: true,
-    disabled: true,
+    disabled: false,
     note: "Okta MCP Bridge is temporarily unavailable",
     mcpServers: [
       {
@@ -81,7 +81,7 @@ export const PATTERNS: Pattern[] = [
     agentHealthUrl: process.env.P2_AGENT_INTERNAL_URL ?? "http://localhost:3200",
     rightPanel: "chat",
     buildStatus: "done",
-    disabled: true,
+    disabled: false,
     note: "Okta MCP Bridge is temporarily unavailable",
     mcpServers: [
       {
@@ -139,7 +139,7 @@ export const PATTERNS: Pattern[] = [
     requiresUserToken: true,
     buildStatus: "done",
     hasAgentStatus: true,
-    disabled: true,
+    disabled: false,
   },
   {
     id: "p5",

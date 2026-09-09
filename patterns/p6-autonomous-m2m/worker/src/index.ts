@@ -37,6 +37,9 @@ const DOMAIN_SCOPE = process.env.DOMAIN_SCOPE ?? (WORKER_DOMAIN === "finance" ? 
 const DOMAIN_ISSUER = DOMAIN_AUTHZ_SERVER_ID ? `https://${OKTA_DOMAIN}/oauth2/${DOMAIN_AUTHZ_SERVER_ID}` : "";
 
 const ORG_TOKEN_URL = `https://${OKTA_DOMAIN}/oauth2/v1/token`;
+const OKTA_API_TOKEN = process.env.OKTA_API_TOKEN ?? "";
+const OKTA_CLIENT_SECRET = process.env.OKTA_CLIENT_SECRET ?? "";
+
 const PATTERN_ID = "p6";
 const ACTOR = `${WORKER_LABEL} Worker`;
 
@@ -83,6 +86,47 @@ async function buildAgentJwt(audience: string): Promise<string> {
     .sign(privateKey);
 }
 
+type AuthMethod = "jwt-bearer" | "client_credential" | "client_id_only";
+let agentAuthMethod: AuthMethod = "client_credential";
+
+async function buildClientAuthParams(tokenUrl: string): Promise<Record<string, string>> {
+  if (agentAuthMethod === "jwt-bearer") {
+    const clientAssertion = await buildAgentJwt(tokenUrl);
+    return {
+      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+      client_assertion: clientAssertion,
+    };
+  }
+  if (agentAuthMethod === "client_id_only") {
+    return { client_id: OKTA_AI_AGENT_ID };
+  }
+  return { client_id: OKTA_AI_AGENT_ID, client_secret: OKTA_CLIENT_SECRET };
+}
+
+async function initAgent(): Promise<void> {
+  if (!OKTA_API_TOKEN) return;
+  const agentResp = await fetch(
+    `https://${OKTA_DOMAIN}/workload-principals/api/v1/ai-agents/${OKTA_AI_AGENT_ID}`,
+    { headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" } }
+  );
+  if (!agentResp.ok) return;
+  const agentData = await agentResp.json() as { signOnProvider?: { appInstanceId?: string } };
+  const appInstanceId = agentData.signOnProvider?.appInstanceId;
+  if (!appInstanceId) return;
+  const appResp = await fetch(
+    `https://${OKTA_DOMAIN}/api/v1/apps/${appInstanceId}`,
+    { headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" } }
+  );
+  if (!appResp.ok) return;
+  const appData = await appResp.json() as { credentials?: { oauthClient?: { token_endpoint_auth_method?: string } } };
+  const authMethod = appData.credentials?.oauthClient?.token_endpoint_auth_method;
+  if (authMethod === "private_key_jwt") agentAuthMethod = "jwt-bearer";
+  else if (authMethod === "client_secret_post" || authMethod === "client_secret_basic") agentAuthMethod = "client_credential";
+  else if (authMethod === "none") agentAuthMethod = "client_id_only";
+  else agentAuthMethod = "client_credential";
+  console.log(`[Okta] Agent auth method: ${agentAuthMethod} (token_endpoint_auth_method=${authMethod ?? "unknown"})`);
+}
+
 // ── Inbound: validate the orchestrator's A2A token ─────────────────────────────
 interface InboundClaims {
   sub: string;
@@ -120,7 +164,9 @@ async function validateInboundToken(authHeader: string | undefined): Promise<Inb
 // ── Downstream: token-exchange the A2A token for a domain resource token ───────
 // Step A — token-exchange → ID-JAG (subject = the inbound A2A token; transitive delegation)
 async function getDomainIdJag(subjectToken: string): Promise<string> {
-  const clientAssertion = await buildAgentJwt(ORG_TOKEN_URL);
+  const authParams = await buildClientAuthParams(ORG_TOKEN_URL);
+  console.log("RRRRRRRRRRr")
+  console.log(JSON.stringify(authParams))
   const detail =
     `POST ${ORG_TOKEN_URL}\n` +
     `  grant_type           = urn:ietf:params:oauth:grant-type:token-exchange\n` +
@@ -129,7 +175,7 @@ async function getDomainIdJag(subjectToken: string): Promise<string> {
     `  subject_token_type   = ${TX.subjectTokenType}\n` +
     `  audience             = ${DOMAIN_ISSUER}\n` +
     `  scope                = ${DOMAIN_SCOPE}\n` +
-    `  client_assertion     = ${clientAssertion.slice(0, 16)}… (iss=sub=${OKTA_AI_AGENT_ID})`;
+    `  auth_method          = ${agentAuthMethod} (iss=sub=${OKTA_AI_AGENT_ID})`;
   await emitEvent(ACTOR, "token-exchange → ID-JAG", "Okta Org Server", detail, undefined, "auth");
 
   const resp = await fetch(ORG_TOKEN_URL, {
@@ -142,8 +188,7 @@ async function getDomainIdJag(subjectToken: string): Promise<string> {
       subject_token_type: TX.subjectTokenType,
       audience: DOMAIN_ISSUER,
       scope: DOMAIN_SCOPE,
-      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-      client_assertion: clientAssertion,
+      ...authParams,
     }),
   });
   if (!resp.ok) throw new Error(`domain ID-JAG exchange failed: ${resp.status} ${await resp.text()}`);
@@ -154,15 +199,14 @@ async function getDomainIdJag(subjectToken: string): Promise<string> {
 // Step B — ID-JAG → domain resource token (no scope param)
 async function getDomainToken(idJag: string): Promise<string> {
   const tokenUrl = `${DOMAIN_ISSUER}/v1/token`;
-  const clientAssertion = await buildAgentJwt(tokenUrl);
+  const authParams = await buildClientAuthParams(tokenUrl);
   const resp = await fetch(tokenUrl, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
       assertion: idJag,
-      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-      client_assertion: clientAssertion,
+      ...authParams,
     }),
   });
   if (!resp.ok) throw new Error(`domain resource token exchange failed: ${resp.status} ${await resp.text()}`);
@@ -346,4 +390,5 @@ app.listen(PORT, () => {
   console.log(`  A2A resource (inbound aud) = ${A2A_RESOURCE || "(unset)"}  issuer = ${A2A_ISSUER || "(unset)"}`);
   console.log(`  domain MCP = ${MCP_URL}  domain issuer = ${DOMAIN_ISSUER || "(unset)"}  scope = ${DOMAIN_SCOPE}`);
   emitEvent(ACTOR, "started", "event-bus", `port=${PORT} identity=${OKTA_AI_AGENT_ID || "not configured"}`, undefined, "info");
+  initAgent().catch((err) => console.warn("[Okta] Auth method detection failed:", err));
 });

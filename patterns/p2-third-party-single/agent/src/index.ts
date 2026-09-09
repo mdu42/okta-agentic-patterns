@@ -57,12 +57,14 @@ interface DcrRegistration {
 }
 
 async function performDcr(): Promise<DcrRegistration> {
-  await emitEvent("Consumer Agent", "requesting registration", "MCP Adapter", `DCR → ${MCP_ADAPTER_URL}/.well-known/oauth/registration`, undefined, "auth");
-  const res = await fetch(`${MCP_ADAPTER_URL}/.well-known/oauth/registration`, {
+  await emitEvent("Consumer Agent", "requesting registration", "MCP Adapter", `DCR → ${MCP_ADAPTER_URL}/oauth/register`, undefined, "auth");
+  // const res = await fetch(`${MCP_ADAPTER_URL}/.well-known/oauth/registration`, {
+  //       // client_name: "P2 Consumer Agent",
+  const res = await fetch(`${MCP_ADAPTER_URL}/oauth/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      client_name: "P2 Consumer Agent",
+      client_name: "okta-demo-p2-embedded",
       redirect_uris: [REDIRECT_URI],
       grant_types: ["authorization_code"],
       response_types: ["code"],

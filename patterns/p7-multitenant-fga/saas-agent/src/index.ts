@@ -22,6 +22,8 @@ const OKTA_FGA_API_URL = (process.env.OKTA_FGA_API_URL ?? "https://api.us1.fga.d
 const OKTA_FGA_CLIENT_ID = process.env.OKTA_FGA_CLIENT_ID ?? "";
 const OKTA_FGA_CLIENT_SECRET = process.env.OKTA_FGA_CLIENT_SECRET ?? "";
 const OKTA_FGA_AUTHORIZATION_MODEL_ID = process.env.OKTA_FGA_AUTHORIZATION_MODEL_ID ?? "";
+const OKTA_API_TOKEN = process.env.OKTA_API_TOKEN ?? "";
+const OKTA_CLIENT_SECRET = process.env.OKTA_CLIENT_SECRET ?? "";
 const PATTERN_ID = "p7";
 
 // ── Static server config ────────────────────────────────────────────────────
@@ -170,6 +172,47 @@ async function buildAgentJwt(audience: string): Promise<string> {
   return jwt;
 }
 
+type AuthMethod = "jwt-bearer" | "client_credential" | "client_id_only";
+let agentAuthMethod: AuthMethod = "client_credential";
+
+async function buildClientAuthParams(tokenUrl: string): Promise<Record<string, string>> {
+  if (agentAuthMethod === "jwt-bearer") {
+    const clientAssertion = await buildAgentJwt(tokenUrl);
+    return {
+      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+      client_assertion: clientAssertion,
+    };
+  }
+  if (agentAuthMethod === "client_id_only") {
+    return { client_id: OKTA_AI_AGENT_ID };
+  }
+  return { client_id: OKTA_AI_AGENT_ID, client_secret: OKTA_CLIENT_SECRET };
+}
+
+async function initAgent(): Promise<void> {
+  if (!OKTA_API_TOKEN) return;
+  const agentResp = await fetch(
+    `https://${OKTA_DOMAIN}/workload-principals/api/v1/ai-agents/${OKTA_AI_AGENT_ID}`,
+    { headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" } }
+  );
+  if (!agentResp.ok) return;
+  const agentData = await agentResp.json() as { signOnProvider?: { appInstanceId?: string } };
+  const appInstanceId = agentData.signOnProvider?.appInstanceId;
+  if (!appInstanceId) return;
+  const appResp = await fetch(
+    `https://${OKTA_DOMAIN}/api/v1/apps/${appInstanceId}`,
+    { headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" } }
+  );
+  if (!appResp.ok) return;
+  const appData = await appResp.json() as { credentials?: { oauthClient?: { token_endpoint_auth_method?: string } } };
+  const authMethod = appData.credentials?.oauthClient?.token_endpoint_auth_method;
+  if (authMethod === "private_key_jwt") agentAuthMethod = "jwt-bearer";
+  else if (authMethod === "client_secret_post" || authMethod === "client_secret_basic") agentAuthMethod = "client_credential";
+  else if (authMethod === "none") agentAuthMethod = "client_id_only";
+  else agentAuthMethod = "client_credential";
+  console.log(`[Okta] Agent auth method: ${agentAuthMethod} (token_endpoint_auth_method=${authMethod ?? "unknown"})`);
+}
+
 async function getIdJag(
   userIdToken: string,
   issuerUrl: string,
@@ -177,7 +220,7 @@ async function getIdJag(
   label: string
 ): Promise<string> {
   const orgTokenUrl = `https://${OKTA_DOMAIN}/oauth2/v1/token`;
-  const clientAssertion = await buildAgentJwt(orgTokenUrl);
+  const authParams = await buildClientAuthParams(orgTokenUrl);
   const scope = scopes.join(" ");
 
   const p = (s: string) => s.padEnd(24);
@@ -189,7 +232,7 @@ async function getIdJag(
     `  ${p("subject_token_type")} = urn:ietf:params:oauth:token-type:id_token\n` +
     `  ${p("audience")} = ${issuerUrl}\n` +
     `  ${p("scope")} = ${scope}\n` +
-    `  ${p("client_assertion")} = iss=sub=${OKTA_AI_AGENT_ID}`;
+    `  ${p("auth_method")} = ${agentAuthMethod} (iss=sub=${OKTA_AI_AGENT_ID})`;
 
   console.log(`\n[P7 XAA Step 1 — ID-JAG Request]\n  ${requestDetail.replace(/\n/g, "\n  ")}`);
   await emitEvent("P7 Agent", "XAA Step 1 — ID-JAG request", "Okta Org Server", requestDetail, undefined, "auth");
@@ -204,8 +247,7 @@ async function getIdJag(
       subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
       audience: issuerUrl,
       scope,
-      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-      client_assertion: clientAssertion,
+      ...authParams,
     }),
   });
   if (!resp.ok) {
@@ -225,14 +267,14 @@ async function getStep2Token(
   label: string
 ): Promise<string> {
   const tokenUrl = `${issuerUrl}/v1/token`;
-  const clientAssertion = await buildAgentJwt(tokenUrl);
+  const authParams = await buildClientAuthParams(tokenUrl);
 
   const p2 = (s: string) => s.padEnd(24);
   const requestDetail2 =
     `POST ${tokenUrl}\n` +
     `  ${p2("grant_type")} = urn:ietf:params:oauth:grant-type:jwt-bearer\n` +
     `  ${p2("assertion")} = ${idJag.slice(0, 16)}… (ID-JAG from Step 1)\n` +
-    `  ${p2("client_assertion")} = iss=sub=${OKTA_AI_AGENT_ID}\n` +
+    `  ${p2("auth_method")} = ${agentAuthMethod} (iss=sub=${OKTA_AI_AGENT_ID})\n` +
     `  [scope omitted — locked inside ID-JAG]`;
 
   console.log(`\n[P7 XAA Step 2 — Resource Token Request]\n  ${requestDetail2.replace(/\n/g, "\n  ")}`);
@@ -244,8 +286,7 @@ async function getStep2Token(
     body: new URLSearchParams({
       grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
       assertion: idJag,
-      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-      client_assertion: clientAssertion,
+      ...authParams,
     }),
   });
   if (!resp.ok) {
@@ -625,4 +666,5 @@ app.listen(PORT, () => {
   console.log(`[P7 Agent] Listening on :${PORT}`);
   console.log(`[P7 Agent] FGA store: ${OKTA_FGA_STORE_ID || "(not set)"}`);
   console.log(`[P7 Agent] Servers: ${STATIC_SERVERS.map((s) => s.label).join(", ") || "none"}`);
+  initAgent().catch((err) => console.warn("[Okta] Auth method detection failed:", err));
 });

@@ -13,6 +13,9 @@ services:
     environment:
       PORT: 4000
     logging: *default-logging
+    networks:
+      - internal
+      - shared
 
   console:
     build: ./console
@@ -71,6 +74,9 @@ services:
     depends_on:
       - event-bus
     logging: *default-logging
+    networks:
+      - internal
+      - shared
 
   # ── Shared MCP Resource Servers (used by P1, P3, and future patterns) ────────
   hr-server:
@@ -88,6 +94,9 @@ services:
     depends_on:
       - event-bus
     logging: *default-logging
+    networks:
+      - internal
+      - shared
 
   finance-server:
     build: ./shared/mcp-servers/finance
@@ -104,6 +113,9 @@ services:
     depends_on:
       - event-bus
     logging: *default-logging
+    networks:
+      - internal
+      - shared
 
   inventory-server:
     build: ./shared/mcp-servers/inventory
@@ -120,6 +132,10 @@ services:
     depends_on:
       - event-bus
     logging: *default-logging
+    networks:
+      - internal
+      - shared
+
 
   # ── Pattern 2: 3rd Party → Single Resource ───────────────────────────────────
   p2-agent:
@@ -133,7 +149,7 @@ services:
       # Standalone MCP adapter — set MCP_ADAPTER_URL in .env to your deployed bridge URL
       MCP_ADAPTER_URL: ${MCP_ADAPTER_URL:-}
       # Browser-accessible adapter URL for auth redirects embedded in auth links
-      MCP_ADAPTER_PUBLIC_URL: ${MCP_ADAPTER_URL:-}
+      MCP_ADAPTER_PUBLIC_URL: ${MCP_ADAPTER_PUBLIC_URL:-}
       # Direct inventory server URL — used for unauthenticated tool discovery (adapter requires auth)
       INVENTORY_SERVER_URL: http://inventory-server:3103
       # Console base URL — used to build the redirect_uri in the auth flow
@@ -145,6 +161,10 @@ services:
       - event-bus
       - inventory-server
     logging: *default-logging
+    networks:
+      - internal
+      - shared
+
 
   # ── Pattern 3: 1st Party XAA Native ─────────────────────────────────────────
   p3-agent:
@@ -164,6 +184,7 @@ services:
       # OKTA_CLIENT_ID: ${P3_OKTA_CLIENT_ID:-}
       OKTA_AI_AGENT_ID: ${P3_OKTA_AI_AGENT_ID:-}
       OKTA_PRIVATE_KEY: ${P3_OKTA_PRIVATE_KEY:-}
+      OKTA_CLIENT_SECRET: ${P3_OKTA_CLIENT_SECRET:-}
       PROTECTED_API_URL: http://hr-server:3101
       FINANCE_API_URL: http://finance-server:3102
       # Audience strings: link Docker-internal URLs to Okta connections (auth config comes from Connections API)
@@ -182,6 +203,9 @@ services:
       - finance-server
       - event-bus
     logging: *default-logging
+    networks:
+      - internal
+
 
   # ── Pattern 4: Outbound SaaS via Okta STS ────────────────────────────────────
   p4-agent:
@@ -201,9 +225,14 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       NODE_TLS_REJECT_UNAUTHORIZED: "0"
+      OKTA_API_TOKEN: ${OKTA_API_TOKEN:-}
+      OKTA_CLIENT_SECRET: ${P4_OKTA_CLIENT_SECRET:-}      
     depends_on:
       - event-bus
     logging: *default-logging
+    networks:
+      - internal
+
 
   # ── Pattern 5: Human-in-the-Loop (CIBA) ─────────────────────────────────────
   p5-agent:
@@ -229,6 +258,8 @@ services:
       - inventory-server
       - event-bus
     logging: *default-logging
+    networks:
+      - internal
 
   # ── Pattern 6: Autonomous M2M ────────────────────────────────────────────────
   # ── Pattern 6: Autonomous Agent-to-Agent (A2A) orchestrator ──────────────────
@@ -251,6 +282,7 @@ services:
       # Orchestrator as A2A resource — validates inbound CC tokens (Mission 1 / autonomous)
       ORCH_A2A_RESOURCE: ${P6_ORCH_A2A_RESOURCE:-}
       ORCH_A2A_AUTHZ_SERVER_ID: ${P6_ORCH_A2A_AUTHZ_SERVER_ID:-}
+      ORCH_OKTA_CLIENT_SECRET: ${P6_ORCHESTRATOR_OKTA_CLIENT_SECRET:-}
       # A2A worker mapping; refined by the Connections API
       HR_WORKER_A2A_RESOURCE: ${P6_HR_WORKER_A2A_RESOURCE:-}
       HR_WORKER_RESOURCE_URL: ${P6_HR_WORKER_RESOURCE_URL:-}
@@ -260,6 +292,7 @@ services:
       FINANCE_WORKER_RESOURCE_URL: ${P6_FINANCE_WORKER_RESOURCE_URL:-}
       FINANCE_WORKER_A2A_AUTHZ_SERVER_ID: ${P6_FINANCE_WORKER_A2A_AUTHZ_SERVER_ID:-}
       FINANCE_WORKER_URL: ${P6_FINANCE_WORKER_URL:-http://p6-finance-worker:3602}
+      FINANCE_OKTA_CLIENT_SECRET: ${P6_FINANCE_OKTA_CLIENT_SECRET:-}
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
       SLACK_DEFAULT_CHANNEL: ${SLACK_DEFAULT_CHANNEL:-general}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -270,6 +303,8 @@ services:
       - p6-hr-worker
       - p6-finance-worker
     logging: *default-logging
+    networks:
+      - internal
 
   # ── P6 worker agents (shared image, one deployment per domain) ───────────────
   p6-hr-worker:
@@ -295,10 +330,14 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       NODE_TLS_REJECT_UNAUTHORIZED: "0"
+      OKTA_API_TOKEN: ${OKTA_API_TOKEN:-}  
+      OKTA_CLIENT_SECRET: ${P6_HR_WORKER_OKTA_CLIENT_SECRET:-}
     depends_on:
       - event-bus
       - hr-server
     logging: *default-logging
+    networks:
+      - internal
 
   p6-finance-worker:
     build: ./patterns/p6-autonomous-m2m/worker
@@ -323,10 +362,14 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       NODE_TLS_REJECT_UNAUTHORIZED: "0"
+      OKTA_API_TOKEN: ${OKTA_API_TOKEN:-}  
+      OKTA_CLIENT_SECRET: ${P6_FINANCE_WORKER_OKTA_CLIENT_SECRET:-}
     depends_on:
       - event-bus
       - finance-server
     logging: *default-logging
+    networks:
+      - internal
 
   # ── Pattern 7: Agentic Permission Scoping (XAA + Okta FGA) ───────────────────
   p7-saas-agent:
@@ -359,6 +402,15 @@ services:
       - hr-server
       - finance-server
     logging: *default-logging
+    networks:
+      - internal
 
 volumes:
   console-data:
+
+networks:
+  internal:
+    driver: bridge
+  shared:
+    external: true
+    name: inter-project  

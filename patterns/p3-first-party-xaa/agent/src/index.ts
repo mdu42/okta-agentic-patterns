@@ -31,6 +31,7 @@ const HR_AUTHZ_SERVER_ID = process.env.HR_AUTHZ_SERVER_ID ?? "";
 const FINANCE_AUTHZ_SERVER_ID = process.env.FINANCE_AUTHZ_SERVER_ID ?? "";
 const OKTA_API_TOKEN = process.env.OKTA_API_TOKEN ?? "";
 const SLACK_STS_RESOURCE = process.env.SLACK_STS_RESOURCE ?? "";
+const OKTA_CLIENT_SECRET = process.env.OKTA_CLIENT_SECRET ?? "";
 const PATTERN_ID = "p3";
 
 interface DiscoveredServer {
@@ -68,6 +69,8 @@ let discoveredServers: DiscoveredServer[] = [];
 let statusConnections: StatusConnection[] = [];
 let loadState: LoadState = "loading";
 let loadFallbackReason = "";
+type AuthMethod = "jwt-bearer" | "client_credential" | "client_id_only";
+let agentAuthMethod: AuthMethod = "client_credential";
 
 type DynamicToolMap = Map<string, DiscoveredServer>;
 
@@ -128,6 +131,41 @@ async function loadAgentConnections(): Promise<void> {
     console.warn("[Okta] OKTA_API_TOKEN not set — activating static fallback");
     activateFallback("no API token");
     return;
+  }
+
+  // Detect which auth method this agent uses from the Okta app configuration
+  try {
+    const agentResp = await fetch(
+      `https://${OKTA_DOMAIN}/workload-principals/api/v1/ai-agents/${OKTA_AI_AGENT_ID}`,
+      { headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" } }
+    );
+    if (agentResp.ok) {
+      const agentData = await agentResp.json() as { signOnProvider?: { appInstanceId?: string } };
+      const appInstanceId = agentData.signOnProvider?.appInstanceId;
+      if (appInstanceId) {
+        const appResp = await fetch(
+          `https://${OKTA_DOMAIN}/api/v1/apps/${appInstanceId}`,
+          { headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" } }
+        );
+        if (appResp.ok) {
+          const appData = await appResp.json() as { credentials?: { oauthClient?: { token_endpoint_auth_method?: string } } };
+          const authMethod = appData.credentials?.oauthClient?.token_endpoint_auth_method;
+          if (authMethod === "private_key_jwt") {
+            agentAuthMethod = "jwt-bearer";
+          } else if (authMethod === "client_secret_post" || authMethod === "client_secret_basic") {
+            agentAuthMethod = "client_credential";
+          } else if (authMethod === "none") {
+            agentAuthMethod = "client_id_only";
+          } else {
+            agentAuthMethod = "client_credential";
+          }
+          console.log(`[Okta] Agent auth method: ${agentAuthMethod} (token_endpoint_auth_method=${authMethod ?? "unknown"})`);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[Okta] Failed to detect auth method, using client_credential fallback:", err);
+    agentAuthMethod = "client_credential";
   }
 
   const url = `https://${OKTA_DOMAIN}/workload-principals/api/v1/ai-agents/${OKTA_AI_AGENT_ID}/connections?limit=200`;
@@ -251,6 +289,20 @@ async function buildAgentJwt(audience: string): Promise<string> {
     .sign(privateKey);
 }
 
+async function buildClientAuthParams(tokenUrl: string): Promise<Record<string, string>> {
+  if (agentAuthMethod === "jwt-bearer") {
+    const clientAssertion = await buildAgentJwt(tokenUrl);
+    return {
+      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+      client_assertion: clientAssertion,
+    };
+  }
+  if (agentAuthMethod === "client_id_only") {
+    return { client_id: AGENT_CLIENT_ID };
+  }
+  return { client_id: AGENT_CLIENT_ID, client_secret: OKTA_CLIENT_SECRET };
+}
+
 interface RequestContext {
   userIdToken: string;
   tokenCache: Map<string, string>; // "server:scope1 scope2" → resource token
@@ -263,7 +315,7 @@ async function getIdJag(userIdToken: string, issuerUrl: string, scopes: string[]
   const authzUrl = issuerUrl;
   const scope = scopes.join(" ");
 
-  const clientAssertion = await buildAgentJwt(orgTokenUrl);
+  const authParams = await buildClientAuthParams(orgTokenUrl);
 
   const p = (s: string) => s.padEnd(24);
   const requestDetail =
@@ -274,8 +326,7 @@ async function getIdJag(userIdToken: string, issuerUrl: string, scopes: string[]
     `  ${p("subject_token_type")} = urn:ietf:params:oauth:token-type:id_token\n` +
     `  ${p("audience")} = ${authzUrl}\n` +
     `  ${p("scope")} = ${scope}\n` +
-    `  ${p("client_assertion_type")} = urn:ietf:params:oauth:client-assertion-type:jwt-bearer\n` +
-    `  ${p("client_assertion")} = ${clientAssertion.slice(0, 20)}… (iss=sub=${AGENT_CLIENT_ID})`;
+    `  ${p("auth_method")} = ${agentAuthMethod}`;
 
   console.log(`\n[XAA Step 1 — ID-JAG Request]\n  ${requestDetail.replace(/\n/g, "\n  ")}`);
   await emitEvent("P3 Agent", "XAA Step 1 — ID-JAG request", "Okta Org Server", requestDetail, undefined, "auth");
@@ -290,8 +341,7 @@ async function getIdJag(userIdToken: string, issuerUrl: string, scopes: string[]
       subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
       audience: authzUrl,
       scope,
-      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-      client_assertion: clientAssertion,
+      ...authParams,
     }),
   });
 
@@ -310,15 +360,14 @@ async function getIdJag(userIdToken: string, issuerUrl: string, scopes: string[]
 async function getStep2Token(idJag: string, issuerUrl: string, audience: string, label: string): Promise<string> {
   const authzTokenUrl = `${issuerUrl}/v1/token`;
 
-  const clientAssertion = await buildAgentJwt(authzTokenUrl);
+  const authParams = await buildClientAuthParams(authzTokenUrl);
 
   const p2 = (s: string) => s.padEnd(24);
   const requestDetail2 =
     `POST ${authzTokenUrl}\n` +
     `  ${p2("grant_type")} = urn:ietf:params:oauth:grant-type:jwt-bearer\n` +
     `  ${p2("assertion")} = ${idJag.slice(0, 16)}… (ID-JAG from Step 1)\n` +
-    `  ${p2("client_assertion_type")} = urn:ietf:params:oauth:client-assertion-type:jwt-bearer\n` +
-    `  ${p2("client_assertion")} = ${clientAssertion.slice(0, 20)}… (iss=sub=${AGENT_CLIENT_ID})\n` +
+    `  ${p2("auth_method")} = ${agentAuthMethod}\n` +
     `  [scope omitted — scopes are locked inside the ID-JAG]`;
 
   console.log(`\n[XAA Step 2 — Resource Token Request]\n  ${requestDetail2.replace(/\n/g, "\n  ")}`);
@@ -330,8 +379,7 @@ async function getStep2Token(idJag: string, issuerUrl: string, audience: string,
     body: new URLSearchParams({
       grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
       assertion: idJag,
-      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-      client_assertion: clientAssertion,
+      ...authParams,
     }),
   });
 
@@ -366,14 +414,13 @@ type StsResult =
 
 async function exchangeForSlackToken(userIdToken: string): Promise<StsResult> {
   const orgTokenUrl = `https://${OKTA_DOMAIN}/oauth2/v1/token`;
-  const clientAssertion = await buildAgentJwt(orgTokenUrl);
+  const authParams = await buildClientAuthParams(orgTokenUrl);
   const params = new URLSearchParams({
     grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
     requested_token_type: "urn:okta:params:oauth:token-type:oauth-sts",
     subject_token: userIdToken,
     subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
-    client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-    client_assertion: clientAssertion,
+    ...authParams,
     resource: SLACK_STS_RESOURCE,
   });
   try {

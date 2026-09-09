@@ -11,7 +11,12 @@ const OKTA_AI_AGENT_ID = process.env.OKTA_AI_AGENT_ID ?? "";
 const OKTA_PRIVATE_KEY = process.env.OKTA_PRIVATE_KEY ?? "";
 const GITHUB_STS_RESOURCE = process.env.GITHUB_STS_RESOURCE ?? "";
 const SLACK_STS_RESOURCE = process.env.SLACK_STS_RESOURCE ?? "";
+const OKTA_API_TOKEN = process.env.OKTA_API_TOKEN ?? "";
+const OKTA_CLIENT_SECRET = process.env.OKTA_CLIENT_SECRET ?? "";
 const PATTERN_ID = "p4";
+
+type AuthMethod = "jwt-bearer" | "client_credential" | "client_id_only";
+let agentAuthMethod: AuthMethod = "client_credential";
 
 async function emitEvent(actor: string, action: string, target: string, detail?: string, tokenSnippet?: string, level = "auth", token?: string) {
   try {
@@ -40,6 +45,57 @@ async function makeClientAssertion(audience?: string): Promise<string> {
     .sign(key);
 }
 
+async function buildClientAuthParams(tokenUrl: string): Promise<Record<string, string>> {
+  if (agentAuthMethod === "jwt-bearer") {
+    const clientAssertion = await makeClientAssertion(tokenUrl);
+    return {
+      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+      client_assertion: clientAssertion,
+    };
+  }
+  if (agentAuthMethod === "client_id_only") {
+    return { client_id: OKTA_AI_AGENT_ID };
+  }
+  return { client_id: OKTA_AI_AGENT_ID, client_secret: OKTA_CLIENT_SECRET };
+}
+
+async function initAgent(): Promise<void> {
+  if (!OKTA_API_TOKEN) return;
+  try {
+    const agentResp = await fetch(
+      `https://${OKTA_DOMAIN}/workload-principals/api/v1/ai-agents/${OKTA_AI_AGENT_ID}`,
+      { headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" } }
+    );
+    if (agentResp.ok) {
+      const agentData = await agentResp.json() as { signOnProvider?: { appInstanceId?: string } };
+      const appInstanceId = agentData.signOnProvider?.appInstanceId;
+      if (appInstanceId) {
+        const appResp = await fetch(
+          `https://${OKTA_DOMAIN}/api/v1/apps/${appInstanceId}`,
+          { headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" } }
+        );
+        if (appResp.ok) {
+          const appData = await appResp.json() as { credentials?: { oauthClient?: { token_endpoint_auth_method?: string } } };
+          const authMethod = appData.credentials?.oauthClient?.token_endpoint_auth_method;
+          if (authMethod === "private_key_jwt") {
+            agentAuthMethod = "jwt-bearer";
+          } else if (authMethod === "client_secret_post" || authMethod === "client_secret_basic") {
+            agentAuthMethod = "client_credential";
+          } else if (authMethod === "none") {
+            agentAuthMethod = "client_id_only";
+          } else {
+            agentAuthMethod = "client_credential";
+          }
+          console.log(`[Okta] Agent auth method: ${agentAuthMethod} (token_endpoint_auth_method=${authMethod ?? "unknown"})`);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[Okta] Failed to detect auth method, using client_credential fallback:", err);
+    agentAuthMethod = "client_credential";
+  }
+}
+
 type StsResult =
   | { kind: "token"; accessToken: string }
   | { kind: "interaction_required"; errorUri: string }
@@ -47,14 +103,13 @@ type StsResult =
 
 async function exchangeForToken(userIdToken: string, resource: string, scope?: string): Promise<StsResult> {
   const orgTokenUrl = `https://${OKTA_DOMAIN}/oauth2/v1/token`;
-  const clientAssertion = await makeClientAssertion(orgTokenUrl);
+  const authParams = await buildClientAuthParams(orgTokenUrl);
   const params = new URLSearchParams({
     grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
     requested_token_type: "urn:okta:params:oauth:token-type:oauth-sts",
     subject_token: userIdToken,
     subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
-    client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-    client_assertion: clientAssertion,
+    ...authParams,
     resource,
   });
   if (scope) params.set("scope", scope);
@@ -477,15 +532,14 @@ app.post("/revoke", async (req, res) => {
   }
 
   const orgTokenUrl = `https://${OKTA_DOMAIN}/oauth2/v1/revoke`;
-  const clientAssertion = await makeClientAssertion(orgTokenUrl);
+  const authParams = await buildClientAuthParams(orgTokenUrl);
   const revokeRes = await fetch(orgTokenUrl, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       token: slackResult.accessToken,
       token_type_hint: "oauth_sts",
-      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-      client_assertion: clientAssertion,
+      ...authParams,
     }).toString(),
   });
 
@@ -645,4 +699,5 @@ app.post("/chat", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`P4 agent listening on :${PORT}`);
   emitEvent("P4 Agent", "started", "event-bus", `port=${PORT}`, undefined, "info");
+  initAgent().catch((err) => console.warn("[Okta] Auth method detection failed:", err));
 });

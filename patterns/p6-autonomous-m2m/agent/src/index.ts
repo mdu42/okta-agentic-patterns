@@ -22,6 +22,7 @@ const OKTA_AI_AGENT_ID = process.env.OKTA_AI_AGENT_ID ?? "";
 const OKTA_PRIVATE_KEY = process.env.OKTA_PRIVATE_KEY ?? "";
 
 const OKTA_API_TOKEN = process.env.OKTA_API_TOKEN ?? "";
+const ORCH_OKTA_CLIENT_SECRET = process.env.ORCH_OKTA_CLIENT_SECRET ?? "";
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN ?? "";
 const SLACK_DEFAULT_CHANNEL = process.env.SLACK_DEFAULT_CHANNEL ?? "general";
 
@@ -73,6 +74,7 @@ function envWorkers(): WorkerCfg[] {
     { key: "hr", label: "HR", resource: process.env.HR_WORKER_A2A_RESOURCE, resourceUrl: process.env.HR_WORKER_RESOURCE_URL, authz: process.env.HR_WORKER_A2A_AUTHZ_SERVER_ID, url: process.env.HR_WORKER_URL },
     { key: "finance", label: "Finance", resource: process.env.FINANCE_WORKER_A2A_RESOURCE, resourceUrl: process.env.FINANCE_WORKER_RESOURCE_URL, authz: process.env.FINANCE_WORKER_A2A_AUTHZ_SERVER_ID, url: process.env.FINANCE_WORKER_URL },
   ];
+  console.log(defs)
   return defs
     .filter((d) => d.resourceUrl && d.url)
     .map((d) => ({
@@ -90,6 +92,9 @@ let discoveredWorkers: WorkerCfg[] = [];
 let statusConnections: StatusConnection[] = [];
 let loadState: LoadState = "loading";
 let loadFallbackReason = "";
+
+type AuthMethod = "jwt-bearer" | "client_credential" | "client_id_only";
+let agentAuthMethod: AuthMethod = "client_credential";
 
 interface OktaConnection {
   id: string;
@@ -115,7 +120,38 @@ function activateFallback(reason: string): void {
 async function loadA2AConnections(): Promise<void> {
   loadFallbackReason = "";
   const envMap = new Map(envWorkers().map((w) => [w.resourceOrn, w]));
+  console.log("JSON.stringify(envMap)")
+  console.log(JSON.stringify(envWorkers()))
   if (!OKTA_API_TOKEN) { activateFallback("no API token"); return; }
+
+  try {
+    const agentResp = await fetch(
+      `https://${OKTA_DOMAIN}/workload-principals/api/v1/ai-agents/${OKTA_AI_AGENT_ID}`,
+      { headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" } }
+    );
+    if (agentResp.ok) {
+      const agentData = await agentResp.json() as { signOnProvider?: { appInstanceId?: string } };
+      const appInstanceId = agentData.signOnProvider?.appInstanceId;
+      if (appInstanceId) {
+        const appResp = await fetch(
+          `https://${OKTA_DOMAIN}/api/v1/apps/${appInstanceId}`,
+          { headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" } }
+        );
+        if (appResp.ok) {
+          const appData = await appResp.json() as { credentials?: { oauthClient?: { token_endpoint_auth_method?: string } } };
+          const authMethod = appData.credentials?.oauthClient?.token_endpoint_auth_method;
+          if (authMethod === "private_key_jwt") agentAuthMethod = "jwt-bearer";
+          else if (authMethod === "client_secret_post" || authMethod === "client_secret_basic") agentAuthMethod = "client_credential";
+          else if (authMethod === "none") agentAuthMethod = "client_id_only";
+          else agentAuthMethod = "client_credential";
+          console.log(`[Okta] Agent auth method: ${agentAuthMethod} (token_endpoint_auth_method=${authMethod ?? "unknown"})`);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[Okta] Failed to detect auth method, using client_credential fallback:", err);
+    agentAuthMethod = "client_credential";
+  }
 
   const url = `https://${OKTA_DOMAIN}/workload-principals/api/v1/ai-agents/${OKTA_AI_AGENT_ID}/connections?limit=200`;
   let connections: OktaConnection[];
@@ -203,6 +239,20 @@ async function buildAgentJwt(audience: string): Promise<string> {
     .sign(privateKey);
 }
 
+async function buildClientAuthParams(tokenUrl: string): Promise<Record<string, string>> {
+  if (agentAuthMethod === "jwt-bearer") {
+    const clientAssertion = await buildAgentJwt(tokenUrl);
+    return {
+      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+      client_assertion: clientAssertion,
+    };
+  }
+  if (agentAuthMethod === "client_id_only") {
+    return { client_id: OKTA_AI_AGENT_ID };
+  }
+  return { client_id: OKTA_AI_AGENT_ID, client_secret: ORCH_OKTA_CLIENT_SECRET };
+}
+
 // The orchestrator's subject is the user's token (forwarded by the console after
 // the user signs in through the app). Decode it for the user's display name.
 function decodeJwtPayload(token: string): Record<string, unknown> {
@@ -232,7 +282,7 @@ async function getA2AIdJag(subjectToken: string, worker: WorkerCfg, tx = TX): Pr
   const audience = worker.a2aIssuerUrl;
   const resource = worker.resourceUrl;
   console.log(`[A2A] step1 audience=${audience} resource=${resource}`);
-  const clientAssertion = await buildAgentJwt(ORG_TOKEN_URL);
+  const authParams = await buildClientAuthParams(ORG_TOKEN_URL);
   const detail =
     `POST ${ORG_TOKEN_URL}\n` +
     `  grant_type           = urn:ietf:params:oauth:grant-type:token-exchange\n` +
@@ -242,13 +292,10 @@ async function getA2AIdJag(subjectToken: string, worker: WorkerCfg, tx = TX): Pr
     `  audience             = ${audience}\n` +
     `  resource             = ${resource}\n` +
     `  scope                = ${tx.a2aScope}\n` +
-    `  client_assertion     = ${clientAssertion.slice(0, 16)}… (iss=sub=${OKTA_AI_AGENT_ID})`;
+    `  auth_method          = ${agentAuthMethod} (iss=sub=${OKTA_AI_AGENT_ID})`;
   await emitEvent("P6 Orchestrator", "A2A token-exchange → ID-JAG", `Okta / ${worker.label} A2A`, detail, undefined, "auth");
 
-  const resp = await fetch(ORG_TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
+  let request_param = {
       grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
       requested_token_type: tx.requestedTokenType,
       subject_token: subjectToken,
@@ -256,9 +303,13 @@ async function getA2AIdJag(subjectToken: string, worker: WorkerCfg, tx = TX): Pr
       audience,
       resource,
       scope: tx.a2aScope,
-      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-      client_assertion: clientAssertion,
-    }),
+      ...authParams,
+    };
+  console.log(JSON.stringify(request_param))
+  const resp = await fetch(ORG_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(request_param),
   });
   if (!resp.ok) throw new Error(`A2A ID-JAG exchange failed (${worker.label}): ${resp.status} ${await resp.text()}`);
   const { access_token: idJag } = await resp.json() as { access_token: string };
@@ -267,15 +318,14 @@ async function getA2AIdJag(subjectToken: string, worker: WorkerCfg, tx = TX): Pr
 
 async function getA2AToken(idJag: string, worker: WorkerCfg): Promise<string> {
   const tokenUrl = `${worker.a2aIssuerUrl}/v1/token`;
-  const clientAssertion = await buildAgentJwt(tokenUrl);
+  const authParams = await buildClientAuthParams(tokenUrl);
   const resp = await fetch(tokenUrl, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
       assertion: idJag,
-      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-      client_assertion: clientAssertion,
+      ...authParams,
     }),
   });
   if (!resp.ok) throw new Error(`A2A resource token exchange failed (${worker.label}): ${resp.status} ${await resp.text()}`);

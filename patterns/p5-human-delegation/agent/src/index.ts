@@ -15,7 +15,12 @@ const INVENTORY_AUTHZ_SERVER_ID = process.env.INVENTORY_AUTHZ_SERVER_ID ?? "defa
 const INVENTORY_RESOURCE_AUDIENCE = process.env.INVENTORY_RESOURCE_AUDIENCE ?? "api://inventory-resource";
 const CIBA_AUTHZ_SERVER_ID = process.env.CIBA_AUTHZ_SERVER_ID ?? INVENTORY_AUTHZ_SERVER_ID;
 const CIBA_AUTHENTICATOR_ID = process.env.CIBA_AUTHENTICATOR_ID ?? "";
+const OKTA_API_TOKEN = process.env.OKTA_API_TOKEN ?? "";
+const OKTA_CLIENT_SECRET = process.env.OKTA_CLIENT_SECRET ?? "";
 const PATTERN_ID = "p5";
+
+type AuthMethod = "jwt-bearer" | "client_credential" | "client_id_only";
+let agentAuthMethod: AuthMethod = "client_credential";
 
 // Tools that require CIBA approval before execution
 const WRITE_TOOLS = new Set(["update_stock"]);
@@ -58,6 +63,57 @@ async function buildAgentJwt(audience: string): Promise<string> {
     .sign(privateKey);
 }
 
+async function buildClientAuthParams(tokenUrl: string): Promise<Record<string, string>> {
+  if (agentAuthMethod === "jwt-bearer") {
+    const clientAssertion = await buildAgentJwt(tokenUrl);
+    return {
+      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+      client_assertion: clientAssertion,
+    };
+  }
+  if (agentAuthMethod === "client_id_only") {
+    return { client_id: OKTA_AI_AGENT_ID };
+  }
+  return { client_id: OKTA_AI_AGENT_ID, client_secret: OKTA_CLIENT_SECRET };
+}
+
+async function initAgent(): Promise<void> {
+  if (!OKTA_API_TOKEN) return;
+  try {
+    const agentResp = await fetch(
+      `https://${OKTA_DOMAIN}/workload-principals/api/v1/ai-agents/${OKTA_AI_AGENT_ID}`,
+      { headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" } }
+    );
+    if (agentResp.ok) {
+      const agentData = await agentResp.json() as { signOnProvider?: { appInstanceId?: string } };
+      const appInstanceId = agentData.signOnProvider?.appInstanceId;
+      if (appInstanceId) {
+        const appResp = await fetch(
+          `https://${OKTA_DOMAIN}/api/v1/apps/${appInstanceId}`,
+          { headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" } }
+        );
+        if (appResp.ok) {
+          const appData = await appResp.json() as { credentials?: { oauthClient?: { token_endpoint_auth_method?: string } } };
+          const authMethod = appData.credentials?.oauthClient?.token_endpoint_auth_method;
+          if (authMethod === "private_key_jwt") {
+            agentAuthMethod = "jwt-bearer";
+          } else if (authMethod === "client_secret_post" || authMethod === "client_secret_basic") {
+            agentAuthMethod = "client_credential";
+          } else if (authMethod === "none") {
+            agentAuthMethod = "client_id_only";
+          } else {
+            agentAuthMethod = "client_credential";
+          }
+          console.log(`[Okta] Agent auth method: ${agentAuthMethod} (token_endpoint_auth_method=${authMethod ?? "unknown"})`);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[Okta] Failed to detect auth method, using client_credential fallback:", err);
+    agentAuthMethod = "client_credential";
+  }
+}
+
 // XAA Step 1: user id_token → ID-JAG at Okta org server
 async function getIdJag(userIdToken: string, authzServerId: string, scopes: string[]): Promise<string> {
   const orgTokenUrl = `https://${OKTA_DOMAIN}/oauth2/v1/token`;
@@ -66,7 +122,7 @@ async function getIdJag(userIdToken: string, authzServerId: string, scopes: stri
 
   await emitEvent("P5 Agent", "ID-JAG exchange", "Okta Org Server", `aud=${authzUrl} scope=${scope}`, undefined, "auth");
 
-  const clientAssertion = await buildAgentJwt(orgTokenUrl);
+  const authParams = await buildClientAuthParams(orgTokenUrl);
   const resp = await fetch(orgTokenUrl, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -77,8 +133,7 @@ async function getIdJag(userIdToken: string, authzServerId: string, scopes: stri
       subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
       audience: authzUrl,
       scope,
-      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-      client_assertion: clientAssertion,
+      ...authParams,
     }),
   });
 
@@ -99,15 +154,14 @@ async function getStep2Token(idJag: string): Promise<string> {
 
   await emitEvent("P5 Agent", "resource token exchange", "Okta Inventory AS", `aud=${INVENTORY_RESOURCE_AUDIENCE}`, undefined, "auth");
 
-  const clientAssertion = await buildAgentJwt(authzTokenUrl);
+  const authParams = await buildClientAuthParams(authzTokenUrl);
   const resp = await fetch(authzTokenUrl, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
       assertion: idJag,
-      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-      client_assertion: clientAssertion,
+      ...authParams,
     }),
   });
 
@@ -125,13 +179,12 @@ async function getStep2Token(idJag: string): Promise<string> {
 // CIBA Step 1: initiate backchannel auth request; returns auth_req_id + poll interval
 async function initiateCiba(loginHint: string, bindingMessage: string): Promise<{ auth_req_id: string; interval: number }> {
   const bcUrl = `https://${OKTA_DOMAIN}/oauth2/${CIBA_AUTHZ_SERVER_ID}/v1/bc/authorize`;
-  const clientAssertion = await buildAgentJwt(bcUrl);
+  const authParams = await buildClientAuthParams(bcUrl);
 
   await emitEvent("P5 Agent", "CIBA bc/authorize", "Okta CIBA AS", `login_hint=${loginHint} scope=inventory:write`, undefined, "auth");
 
   const params = new URLSearchParams({
-    client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-    client_assertion: clientAssertion,
+    ...authParams,
     login_hint: loginHint,
     scope: "inventory:write",
     binding_message: bindingMessage,
@@ -158,7 +211,7 @@ async function initiateCiba(loginHint: string, bindingMessage: string): Promise<
 // CIBA Step 2 (one poll): returns access_token on approval, "pending" on wait, throws CibaDeniedError on deny
 async function pollCibaToken(auth_req_id: string): Promise<"pending" | string> {
   const tokenUrl = `https://${OKTA_DOMAIN}/oauth2/${CIBA_AUTHZ_SERVER_ID}/v1/token`;
-  const clientAssertion = await buildAgentJwt(tokenUrl);
+  const authParams = await buildClientAuthParams(tokenUrl);
 
   const resp = await fetch(tokenUrl, {
     method: "POST",
@@ -166,8 +219,7 @@ async function pollCibaToken(auth_req_id: string): Promise<"pending" | string> {
     body: new URLSearchParams({
       grant_type: "urn:openid:params:grant-type:ciba",
       auth_req_id,
-      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-      client_assertion: clientAssertion,
+      ...authParams,
     }),
   });
 
@@ -570,4 +622,5 @@ app.post("/chat", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`P5 agent listening on :${PORT}`);
   emitEvent("P5 Agent", "started", "event-bus", `port=${PORT}`, undefined, "info");
+  initAgent().catch((err) => console.warn("[Okta] Auth method detection failed:", err));
 });
