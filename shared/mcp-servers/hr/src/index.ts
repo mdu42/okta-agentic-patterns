@@ -49,6 +49,7 @@ async function emitEvent(actor: string, action: string, target: string, detail?:
 interface TokenClaims {
   sub: string;
   act?: { sub: string };
+  scopes: string[];
 }
 
 async function validateToken(authHeader: string | undefined, scopePatternIds?: string[]): Promise<TokenClaims> {
@@ -79,6 +80,7 @@ async function validateToken(authHeader: string | undefined, scopePatternIds?: s
       audience: OKTA_AUDIENCE,
     }));
   } catch (err) {
+    console.log(JWKS.jwks())
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[HR] token validation failed: ${msg} | token.aud=${JSON.stringify(decodedAud)} token.iss=${decodedIss} token.kid=${decodedKid} | expected iss=${OKTA_ISSUER} aud=${OKTA_AUDIENCE}`);
     throw err;
@@ -95,8 +97,16 @@ async function validateToken(authHeader: string | undefined, scopePatternIds?: s
     await emitEvent("HR Server", "validated token", "Okta JWKS", detail, snippet, "token", /*token*/ scopePatternIds);
   }
 
-  return { sub, act: act?.sub ? { sub: act.sub } : undefined };
+  // Okta puts scopes in `scp` (array); some issuers use a space-delimited `scope` string
+  const rawScopes = payload.scp ?? payload.scope;
+  const scopes = Array.isArray(rawScopes) ? rawScopes.map(String) : typeof rawScopes === "string" ? rawScopes.split(" ") : [];
+
+  return { sub, act: act?.sub ? { sub: act.sub } : undefined, scopes };
 }
+
+const TOOL_REQUIRED_SCOPES: Record<string, string[]> = {
+  list_employees: ["hr:read"],
+};
 
 const PUBLIC_TOOLS = new Set(["get_headcount"]);
 
@@ -275,7 +285,15 @@ app.all("/mcp", async (req, res) => {
   const isPublicTool = req.body?.method === "tools/call" && PUBLIC_TOOLS.has(req.body?.params?.name);
   if (!isPublicTool) {
     try {
-      await validateToken(req.headers.authorization, emitPatterns);
+      const claims = await validateToken(req.headers.authorization, emitPatterns);
+      const toolName = req.body?.method === "tools/call" ? req.body?.params?.name : undefined;
+      const missing = (TOOL_REQUIRED_SCOPES[toolName] ?? []).filter((sc) => !claims.scopes.includes(sc));
+      if (missing.length) {
+        const msg = `Insufficient scope: ${toolName} requires ${missing.join(" ")}`;
+        await emitEvent("HR Server", "rejected request", toolName, msg, undefined, "error", emitPatterns);
+        res.status(403).set("WWW-Authenticate", `Bearer error="insufficient_scope", scope="${missing.join(" ")}"`).json({ error: msg });
+        return;
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unauthorized";
       if (req.headers.authorization) {

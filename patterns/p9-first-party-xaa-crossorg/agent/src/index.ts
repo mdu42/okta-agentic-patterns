@@ -85,6 +85,7 @@ type DynamicToolMap = Map<string, DiscoveredServer>;
 const AUDIENCE_SCOPES: Record<string, string[]> = {
   "api:hr":      ["hr:read", "hr:write", "hr:delete"],
   "api:finance": ["finance:read", "finance:write", "finance:approve"],
+  "http://localhost:3105": ["hr:read", "hr:write", "hr:delete"],
 };
 
 // Name-pattern heuristic: pick the minimum scope needed for a tool call
