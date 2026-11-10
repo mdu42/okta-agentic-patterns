@@ -92,7 +92,7 @@ async function validateToken(authHeader: string | undefined, scopePatternIds?: s
   if (!recentlyValidated.has(snippet)) {
     recentlyValidated.add(snippet);
     setTimeout(() => recentlyValidated.delete(snippet), 10000);
-    await emitEvent("HR Server", "validated token", "Okta JWKS", detail, snippet, "token", scopePatternIds);
+    await emitEvent("HR Server", "validated token", "Okta JWKS", detail, snippet, "token", /*token*/ scopePatternIds);
   }
 
   return { sub, act: act?.sub ? { sub: act.sub } : undefined };

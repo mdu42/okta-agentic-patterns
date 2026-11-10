@@ -119,9 +119,12 @@ function activateFallback(reason: string): void {
 // Discover A2A worker connections from the Okta AI Agent Connections API.
 async function loadA2AConnections(): Promise<void> {
   loadFallbackReason = "";
-  const envMap = new Map(envWorkers().map((w) => [w.resourceOrn, w]));
+  const envMap = new Map(envWorkers().map((w) => [w.resourceUrl, w]));
   console.log("JSON.stringify(envMap)")
-  console.log(JSON.stringify(envWorkers()))
+  console.log(envWorkers())
+  console.log("==============")
+  console.log(envMap.size)
+  console.log("==============")
   if (!OKTA_API_TOKEN) { activateFallback("no API token"); return; }
 
   try {
@@ -174,12 +177,16 @@ async function loadA2AConnections(): Promise<void> {
     const issuer = c.authorizationServer?.issuerUrl ?? "(none)";
     console.log(`[Okta]   ${c.resource?.name ?? "?"}: status=${c.status} issuerUrl=${issuer} orn=${orn}`);
   });
+  console.log(a2a.length);
 
   discoveredWorkers = a2a
     .filter((c) => c.status === "ACTIVE")
     .flatMap((c) => {
       const orn = c.resourceIndicator ?? c.resource?.orn;
       const env = orn ? envMap.get(orn) : undefined;
+      console.log(orn)
+      console.log(env)
+
       if (!orn || !env) return [];
       return [{
         ...env,
@@ -187,6 +194,7 @@ async function loadA2AConnections(): Promise<void> {
         active: true,
       }];
     });
+  console.log(discoveredWorkers.length);
 
   statusConnections = a2a.map((c) => {
     const orn = c.resourceIndicator ?? c.resource?.orn;

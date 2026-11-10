@@ -1,0 +1,954 @@
+import express from "express";
+import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { SignJWT, importJWK, importPKCS8 } from "jose";
+import { AsyncLocalStorage } from "node:async_hooks";
+
+// Carries the console viewer's SSE session id across the async call chain of a single
+// /chat request, so emitEvent() can scope events to that viewer without threading a
+// sessionId parameter through every helper function that calls it.
+const requestContext = new AsyncLocalStorage<{ sessionId?: string }>();
+
+const PORT = parseInt(process.env.PORT ?? "3900");
+const EVENT_BUS_URL = process.env.EVENT_BUS_URL ?? "http://localhost:4000";
+const OKTA_DOMAIN = process.env.OKTA_DOMAIN ?? "";
+const OKTA_AI_AGENT_ID = process.env.OKTA_AI_AGENT_ID ?? "";
+const OKTA_CLIENT_ID = process.env.OKTA_CLIENT_ID ?? "";
+const OKTA_PRIVATE_KEY = process.env.OKTA_PRIVATE_KEY ?? "";
+// Client assertions authenticate as this OAuth client at Okta's token endpoint. Newer agents are
+// bound to an existing app's client_id rather than having their own; falls back to the agent ID
+// for agents that are their own client.
+const AGENT_CLIENT_ID = OKTA_CLIENT_ID || OKTA_AI_AGENT_ID;
+const HR_API_URL = process.env.PROTECTED_API_URL ?? "http://hr-server:3101";
+const FINANCE_API_URL = process.env.FINANCE_API_URL ?? "http://finance-server:3102";
+// Audience strings: link Docker-internal URLs to Okta connections; also used for static fallback
+const HR_RESOURCE_AUDIENCE = process.env.HR_RESOURCE_AUDIENCE ?? "";
+const FINANCE_RESOURCE_AUDIENCE = process.env.FINANCE_RESOURCE_AUDIENCE ?? "";
+// Auth server IDs: only used for static fallback when Okta Connections API is unreachable
+const HR_AUTHZ_SERVER_ID = process.env.HR_AUTHZ_SERVER_ID ?? "";
+const FINANCE_AUTHZ_SERVER_ID = process.env.FINANCE_AUTHZ_SERVER_ID ?? "";
+const OKTA_API_TOKEN = process.env.OKTA_API_TOKEN ?? "";
+const SLACK_STS_RESOURCE = process.env.SLACK_STS_RESOURCE ?? "";
+const OKTA_CLIENT_SECRET = process.env.OKTA_CLIENT_SECRET ?? "";
+const HR_CLIENT_ID = process.env.HR_CLIENT_ID ?? OKTA_AI_AGENT_ID;
+const HR_CLIENT_SECRET = process.env.HR_CLIENT_SECRET ?? OKTA_CLIENT_SECRET;
+
+const PATTERN_ID = "p9";
+
+interface DiscoveredServer {
+  label: string;       // display name (e.g. "HR")
+  url: string;         // Docker-internal MCP server URL
+  audience: string;    // token audience = Okta connection resourceIndicator
+  issuerUrl: string;   // full OAuth issuer URL from Okta connection
+  scopes: string[];    // scopes the agent may request for this server
+  authMethod?: string;
+  clientId?: string;
+  clientSecret?: string;
+}
+
+interface OktaConnection {
+  id: string;
+  name?: string;           // human-readable connection name from Okta Admin
+  connectionType: string;
+  status: string;
+  resourceIndicator?: string;
+  authorizationServer?: { issuerUrl: string; orn: string; name?: string };
+  scopeCondition?: string;
+  scopes?: string[];
+  appInstance?: { issuerUrl: string; orn?: string; name?: string };
+}
+
+type LoadState = "loading" | "ready" | "fallback";
+
+interface StatusConnection {
+  label: string;
+  connectionType: string;
+  active: boolean;
+  audience?: string;
+  issuerUrl?: string;
+}
+
+// Loaded once at startup; contains all active IDENTITY_ASSERTION_CUSTOM_AS connections
+let discoveredServers: DiscoveredServer[] = [];
+// All active connections of any type — used for status reporting only
+let statusConnections: StatusConnection[] = [];
+let loadState: LoadState = "loading";
+let loadFallbackReason = "";
+type AuthMethod = "jwt-bearer" | "client_credential" | "client_id_only";
+let agentAuthMethod: AuthMethod = "client_credential";
+
+type DynamicToolMap = Map<string, DiscoveredServer>;
+
+// Known scope sets per audience — used when Okta returns scopeCondition="ALL_SCOPES" (scopes: ["*"])
+const AUDIENCE_SCOPES: Record<string, string[]> = {
+  "api:hr":      ["hr:read", "hr:write", "hr:delete"],
+  "api:finance": ["finance:read", "finance:write", "finance:approve"],
+};
+
+// Name-pattern heuristic: pick the minimum scope needed for a tool call
+const WRITE_PREFIXES = ["update_", "create_", "delete_", "post_", "write_", "set_", "add_", "remove_"];
+
+function getScopesForTool(toolName: string, availableScopes: string[]): string[] {
+  const isWrite = WRITE_PREFIXES.some(p => toolName.startsWith(p));
+  const preferred = isWrite
+    ? availableScopes.filter(s => s.endsWith(":write"))
+    : availableScopes.filter(s => s.endsWith(":read"));
+  return preferred.length > 0 ? preferred : availableScopes;
+}
+
+function activateFallback(reason: string): void {
+  const servers: DiscoveredServer[] = [];
+  if (HR_API_URL && HR_RESOURCE_AUDIENCE && HR_AUTHZ_SERVER_ID) {
+    servers.push({
+      label: "HR",
+      url: HR_API_URL,
+      audience: HR_RESOURCE_AUDIENCE,
+      issuerUrl: `https://${OKTA_DOMAIN}/oauth2/${HR_AUTHZ_SERVER_ID}`,
+      scopes: AUDIENCE_SCOPES[HR_RESOURCE_AUDIENCE] ?? ["hr:read", "hr:write", "hr:delete"],
+    });
+  }
+  if (FINANCE_API_URL && FINANCE_RESOURCE_AUDIENCE && FINANCE_AUTHZ_SERVER_ID) {
+    servers.push({
+      label: "Finance",
+      url: FINANCE_API_URL,
+      audience: FINANCE_RESOURCE_AUDIENCE,
+      issuerUrl: `https://${OKTA_DOMAIN}/oauth2/${FINANCE_AUTHZ_SERVER_ID}`,
+      scopes: AUDIENCE_SCOPES[FINANCE_RESOURCE_AUDIENCE] ?? ["finance:read", "finance:write", "finance:approve"],
+    });
+  }
+  loadFallbackReason = reason;
+  loadState = "fallback";
+  if (servers.length > 0) {
+    discoveredServers = servers;
+    console.warn(`[Okta] Fallback mode active (${reason}): using static env var config for ${servers.map(s => s.label).join(", ")}`);
+  } else {
+    console.warn(`[Okta] Fallback mode: no static config available — agent will have no tools`);
+  }
+  statusConnections = [
+    ...servers.map(s => ({ label: s.label, connectionType: "IDENTITY_ASSERTION_CUSTOM_AS", active: true, audience: s.audience, issuerUrl: s.issuerUrl })),
+    ...(SLACK_STS_RESOURCE ? [{ label: "Slack", connectionType: "STS", active: true }] : []),
+  ];
+}
+
+async function getAppXAAissuer(resource:any): Promise<string> {
+  if (!OKTA_API_TOKEN) return "";
+  if (!(resource.connectionType === 'IDENTITY_ASSERTION_APP_INSTANCE')) return "";
+
+  try {
+    const appIdArray = resource.appInstance.orn.split(":");
+    const appId = appIdArray[appIdArray.length-1];
+    const resp = await fetch(
+      `https://${OKTA_DOMAIN}/api/v1/apps/${appId}/xaa/resource-server`,
+      { headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" } }
+    );
+    if (resp.ok) {
+      const respData = await resp.json() as { issuer: string } 
+      return respData.issuer;
+    }
+    return "";
+  } catch (err) {
+    console.warn("[Okta] No XAA config", err);
+    return "";
+  }
+}
+
+async function fetchAdditionalAppInfo(connections:OktaConnection[]) {
+  for( let c of connections ) {
+    const issuerUrl = await getAppXAAissuer(c);
+    if(issuerUrl !== "" ) {
+      c.appInstance && (c.appInstance.issuerUrl = issuerUrl);
+      c.authorizationServer = {
+        issuerUrl: issuerUrl,
+        orn: 'external'
+      }
+    }
+  };
+}
+
+async function loadAgentConnections(): Promise<void> {
+  loadFallbackReason = "";
+  if (!OKTA_API_TOKEN) {
+    console.warn("[Okta] OKTA_API_TOKEN not set — activating static fallback");
+    activateFallback("no API token");
+    return;
+  }
+
+  // Detect which auth method this agent uses from the Okta app configuration
+  try {
+    const agentResp = await fetch(
+      `https://${OKTA_DOMAIN}/workload-principals/api/v1/ai-agents/${OKTA_AI_AGENT_ID}`,
+      { headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" } }
+    );
+    if (agentResp.ok) {
+      const agentData = await agentResp.json() as { signOnProvider?: { appInstanceId?: string } };
+      const appInstanceId = agentData.signOnProvider?.appInstanceId;
+      if (appInstanceId) {
+        const appResp = await fetch(
+          `https://${OKTA_DOMAIN}/api/v1/apps/${appInstanceId}`,
+          { headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" } }
+        );
+        if (appResp.ok) {
+          const appData = await appResp.json() as { credentials?: { oauthClient?: { token_endpoint_auth_method?: string } } };
+          const authMethod = appData.credentials?.oauthClient?.token_endpoint_auth_method;
+          if (authMethod === "private_key_jwt") {
+            agentAuthMethod = "jwt-bearer";
+          } else if (authMethod === "client_secret_post" || authMethod === "client_secret_basic") {
+            agentAuthMethod = "client_credential";
+          } else if (authMethod === "none") {
+            agentAuthMethod = "client_id_only";
+          } else {
+            agentAuthMethod = "client_credential";
+          }
+          console.log(`[Okta] Agent auth method: ${agentAuthMethod} (token_endpoint_auth_method=${authMethod ?? "unknown"})`);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[Okta] Failed to detect auth method, using client_credential fallback:", err);
+    agentAuthMethod = "client_credential";
+  }
+
+  const url = `https://${OKTA_DOMAIN}/workload-principals/api/v1/ai-agents/${OKTA_AI_AGENT_ID}/connections?limit=200`;
+  let connections: OktaConnection[];
+  try {
+    const resp = await fetch(url, {
+      headers: { Authorization: `SSWS ${OKTA_API_TOKEN}`, Accept: "application/json" },
+    });
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "(unreadable)");
+      console.warn(`[Okta] Connections API returned ${resp.status}: ${body.slice(0, 300)}`);
+      activateFallback(`API error ${resp.status}`);
+      return;
+    }
+    const data = await resp.json();
+    connections = Array.isArray(data) ? data : (data.data ?? data.value ?? data.connections ?? data.items ?? []);
+    if (!Array.isArray(connections)) {
+      console.warn("[Okta] Unexpected Connections API response shape:", JSON.stringify(data).slice(0, 200));
+      activateFallback("unexpected API response shape");
+      return;
+    }
+    await fetchAdditionalAppInfo(connections);
+  } catch (err) {
+    console.warn("[Okta] Connections API unreachable — activating static fallback:", err);
+    activateFallback("API unreachable");
+    return;
+  }
+
+  // URL map: audience → { label, url } — used to resolve Docker-internal URLs
+  const serverUrls: Record<string, { label: string; url: string, authMethod?: string, clientId?:string, clientSecret?:string }> = {};
+  if (HR_API_URL && HR_RESOURCE_AUDIENCE)           serverUrls[HR_RESOURCE_AUDIENCE]      = { label: "HR",      url: HR_API_URL,      authMethod: "client_credential", clientId: HR_CLIENT_ID, clientSecret: HR_CLIENT_SECRET };
+  if (FINANCE_API_URL && FINANCE_RESOURCE_AUDIENCE) serverUrls[FINANCE_RESOURCE_AUDIENCE] = { label: "Finance", url: FINANCE_API_URL };
+
+  const activeConnections = connections.filter(c => c.status === "ACTIVE");
+  console.log(`[Okta] Found ${activeConnections.length}/${connections.length} active connection(s) across all types`);
+  for (const c of connections) {
+    console.log(`  type=${c.connectionType} status=${c.status} resource=${c.resourceIndicator ?? "n/a"} issuer=${c.authorizationServer?.issuerUrl ?? "n/a"}`);
+  }
+
+  // XAA connections: build discoveredServers for MCP tool calling (active only)
+  discoveredServers = activeConnections
+    .filter(c => (c.connectionType === "IDENTITY_ASSERTION_CUSTOM_AS" || c.connectionType === "IDENTITY_ASSERTION_MCP_SERVER" || c.connectionType === "IDENTITY_ASSERTION_APP_INSTANCE"))
+    .flatMap(c => {
+      const entry = c.resourceIndicator ? serverUrls[c.resourceIndicator] : undefined;
+      if (!entry || !c.authorizationServer?.issuerUrl) return [];
+      const rawScopes = c.scopes ?? [];
+      const scopes = rawScopes.length === 1 && rawScopes[0] === "*"
+        ? (AUDIENCE_SCOPES[c.resourceIndicator!] ?? rawScopes)
+        : rawScopes;
+      const authMethod = (c.connectionType === "IDENTITY_ASSERTION_APP_INSTANCE" && entry.authMethod) ? entry.authMethod:undefined;
+      const clientId = (c.connectionType === "IDENTITY_ASSERTION_APP_INSTANCE" && entry.clientId) ? entry.clientId:undefined;;
+      const clientSecret = (c.connectionType === "IDENTITY_ASSERTION_APP_INSTANCE" && entry.clientSecret) ? entry.clientSecret:undefined;;
+
+      return [{
+        label: entry.label,
+        url: entry.url,
+        audience: c.resourceIndicator!,
+        issuerUrl: c.authorizationServer.issuerUrl,
+        scopes,
+        authMethod: authMethod,
+        clientId: clientId,
+        clientSecret: clientSecret
+      }];
+    });
+
+  // ORN → label map for known STS resources
+  const ornLabels: Record<string, string> = {};
+  if (SLACK_STS_RESOURCE) ornLabels[SLACK_STS_RESOURCE] = "Slack";
+
+  // All connections (active + inactive) for status reporting
+  // Label priority: c.name (from Okta Admin) → env var map → authzServer name → ORN segment → connectionType
+  statusConnections = connections.map(c => {
+    console.log(c)
+    const isActive = c.status === "ACTIVE";
+    if (c.connectionType === "IDENTITY_ASSERTION_CUSTOM_AS" || c.connectionType === "IDENTITY_ASSERTION_MCP_SERVER" || c.connectionType === "IDENTITY_ASSERTION_APP_INSTANCE") {
+      const entry = c.resourceIndicator ? serverUrls[c.resourceIndicator] : undefined;
+      const label = entry?.label
+        ?? c.name
+        ?? (c.resourceIndicator ? c.resourceIndicator.split(":").pop()! : c.authorizationServer?.name ?? c.connectionType);
+      return { label, connectionType: c.connectionType, active: isActive, audience: c.resourceIndicator, issuerUrl: c.authorizationServer?.issuerUrl };
+    }
+    // STS and other types
+    const rawLabel = (c.resourceIndicator && ornLabels[c.resourceIndicator])
+      ?? c.name
+      ?? c.authorizationServer?.name
+      ?? (c.resourceIndicator ? c.resourceIndicator.split(":").pop()! : c.connectionType);
+    const label = rawLabel.charAt(0).toUpperCase() + rawLabel.slice(1);
+    return { label, connectionType: c.connectionType, active: isActive, audience: c.resourceIndicator };
+  });
+
+  loadState = "ready";
+  console.log(`[Okta] Loaded ${discoveredServers.length} XAA server(s), ${statusConnections.length} total connection(s)`);
+  for (const s of discoveredServers) {
+    console.log(`  XAA ${s.label}: issuer=${s.issuerUrl} audience=${s.audience} scopes=[${s.scopes.join(",")}]`);
+  }
+}
+
+async function emitEvent(actor: string, action: string, target: string, detail?: string, tokenSnippet?: string, level = "auth", token?: string) {
+  const sessionId = requestContext.getStore()?.sessionId;
+  try {
+    await fetch(`${EVENT_BUS_URL}/emit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ patternId: PATTERN_ID, actor, action, target, detail, tokenSnippet, level, token, sessionId }),
+    });
+  } catch {
+    // Non-fatal
+  }
+}
+
+async function buildAgentJwt(audience: string): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  let privateKey: Parameters<SignJWT["sign"]>[0];
+  let kid: string | undefined;
+  try {
+    const jwk = JSON.parse(OKTA_PRIVATE_KEY);
+    kid = jwk.kid as string | undefined;
+    privateKey = await importJWK(jwk, "RS256") as typeof privateKey;
+  } catch {
+    privateKey = await importPKCS8(OKTA_PRIVATE_KEY, "RS256") as typeof privateKey;
+  }
+  return new SignJWT({})
+    .setProtectedHeader({ alg: "RS256", ...(kid ? { kid } : {}) })
+    .setIssuer(AGENT_CLIENT_ID)
+    .setSubject(AGENT_CLIENT_ID)
+    .setAudience(audience)
+    .setIssuedAt(now)
+    .setExpirationTime(now + 300)
+    .setJti(crypto.randomUUID())
+    .sign(privateKey);
+}
+
+async function buildClientAuthParams(tokenUrl: string, authMethod: string = agentAuthMethod, clientId: string = AGENT_CLIENT_ID, clientSecret: string = OKTA_CLIENT_SECRET): Promise<Record<string, string>> {
+  if (authMethod === "jwt-bearer") {
+    const clientAssertion = await buildAgentJwt(tokenUrl);
+    return {
+      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+      client_assertion: clientAssertion,
+    };
+  }
+  if (authMethod === "client_id_only") {
+    return { client_id: clientId };
+  }
+  return { client_id: clientId, client_secret: clientSecret };
+}
+
+interface RequestContext {
+  userIdToken: string;
+  tokenCache: Map<string, string>; // "server:scope1 scope2" → resource token
+}
+
+// XAA Step 1: id_token → ID-JAG at Okta org server
+// issuerUrl = target auth server URL; scope = scopes to embed in the ID-JAG
+async function getIdJag(userIdToken: string, issuerUrl: string, scopes: string[], label: string): Promise<string> {
+  const orgTokenUrl = `https://${OKTA_DOMAIN}/oauth2/v1/token`;
+  const authzUrl = issuerUrl;
+  const scope = scopes.join(" ");
+
+  const authParams = await buildClientAuthParams(orgTokenUrl);
+
+  const p = (s: string) => s.padEnd(24);
+  const requestDetail =
+    `POST ${orgTokenUrl}\n` +
+    `  ${p("grant_type")} = urn:ietf:params:oauth:grant-type:token-exchange\n` +
+    `  ${p("requested_token_type")} = urn:ietf:params:oauth:token-type:id-jag\n` +
+    `  ${p("subject_token")} = ${userIdToken.slice(0, 16)}… (user id_token)\n` +
+    `  ${p("subject_token_type")} = urn:ietf:params:oauth:token-type:id_token\n` +
+    `  ${p("audience")} = ${authzUrl}\n` +
+    `  ${p("scope")} = ${scope}\n` +
+    `  ${p("auth_method")} = ${agentAuthMethod}`;
+
+  console.log(`\n[XAA Step 1 — ID-JAG Request]\n  ${requestDetail.replace(/\n/g, "\n  ")}`);
+  await emitEvent("P9 Agent", "XAA Step 1 — ID-JAG request", "Okta Org Server", requestDetail, undefined, "auth");
+
+  const resp = await fetch(orgTokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+      requested_token_type: "urn:ietf:params:oauth:token-type:id-jag",
+      subject_token: userIdToken,
+      subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
+      audience: authzUrl,
+      scope,
+      ...authParams,
+    }),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    console.log(resp);
+    throw new Error(`ID-JAG exchange failed (${label}): ${resp.status} ${text}`);
+  }
+
+  const { access_token: idJag } = await resp.json() as { access_token: string };
+  const snippet = idJag.slice(0, 12) + "..." + idJag.slice(-8);
+  await emitEvent("P9 Agent", "obtained ID-JAG", "Okta", `${label} user+agent identity`, snippet, "token", idJag);
+  return idJag;
+}
+
+// XAA Step 2: ID-JAG → resource token at target auth server (scope param must be absent)
+async function getStep2Token(idJag: string, issuerUrl: string, audience: string, label: string,
+    authMethod: string = agentAuthMethod, clientId: string = AGENT_CLIENT_ID, clientSecret: string = OKTA_CLIENT_SECRET
+): Promise<string> {
+  const authzTokenUrl = `${issuerUrl}/v1/token`;
+
+  const authParams = await buildClientAuthParams(authzTokenUrl, agentAuthMethod, clientId, clientSecret);
+
+  const p2 = (s: string) => s.padEnd(24);
+  const requestDetail2 =
+    `POST ${authzTokenUrl}\n` +
+    `  ${p2("grant_type")} = urn:ietf:params:oauth:grant-type:jwt-bearer\n` +
+    `  ${p2("assertion")} = ${idJag.slice(0, 16)}… (ID-JAG from Step 1)\n` +
+    `  ${p2("auth_method")} = ${authMethod}\n` +
+    `  [scope omitted — scopes are locked inside the ID-JAG]`;
+
+  console.log(`\n[XAA Step 2 — Resource Token Request]\n  ${requestDetail2.replace(/\n/g, "\n  ")}`);
+  await emitEvent("P9 Agent", "XAA Step 2 — resource token request", label, requestDetail2, undefined, "auth");
+
+  const resp = await fetch(authzTokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: idJag,
+      ...authParams,
+    }),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Resource token exchange failed (${label}): ${resp.status} ${text}`);
+  }
+
+  const { access_token: resourceToken } = await resp.json() as { access_token: string };
+  const snippet = resourceToken.slice(0, 12) + "..." + resourceToken.slice(-8);
+  await emitEvent("P9 Agent", "obtained resource token", "Okta", `${label} aud=${audience}`, snippet, "token", resourceToken);
+  return resourceToken;
+}
+
+// Returns a resource token for a server+scope combination, reusing cached tokens within a request
+async function getTokenForServer(server: DiscoveredServer, scopes: string[], ctx: RequestContext): Promise<string> {
+  const cacheKey = `${server.issuerUrl}:${[...scopes].sort().join(" ")}`;
+  if (ctx.tokenCache.has(cacheKey)) return ctx.tokenCache.get(cacheKey)!;
+
+  const idJag = await getIdJag(ctx.userIdToken, server.issuerUrl, scopes, server.label);
+  const token = await getStep2Token(idJag, server.issuerUrl, server.audience, server.label, server.authMethod, server.clientId, server.clientSecret);
+  ctx.tokenCache.set(cacheKey, token);
+  return token;
+}
+
+// ── Slack via Okta STS ────────────────────────────────────────────────────────
+
+type StsResult =
+  | { kind: "token"; accessToken: string }
+  | { kind: "interaction_required"; errorUri: string }
+  | { kind: "error"; message: string };
+
+async function exchangeForSlackToken(userIdToken: string): Promise<StsResult> {
+  const orgTokenUrl = `https://${OKTA_DOMAIN}/oauth2/v1/token`;
+  const authParams = await buildClientAuthParams(orgTokenUrl);
+  const params = new URLSearchParams({
+    grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+    requested_token_type: "urn:okta:params:oauth:token-type:oauth-sts",
+    subject_token: userIdToken,
+    subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
+    ...authParams,
+    resource: SLACK_STS_RESOURCE,
+  });
+  try {
+    const res = await fetch(orgTokenUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params,
+    });
+    const body = await res.json() as Record<string, unknown>;
+    if (res.ok && body.access_token) return { kind: "token", accessToken: body.access_token as string };
+    if (body.error === "interaction_required" && body.interaction_uri) {
+      return { kind: "interaction_required", errorUri: body.interaction_uri as string };
+    }
+    return { kind: "error", message: `${body.error}: ${body.error_description}` };
+  } catch (err) {
+    return { kind: "error", message: err instanceof Error ? err.message : "STS exchange failed" };
+  }
+}
+
+const SLACK_TOOLS = [
+  {
+    name: "slack_list_channels",
+    description: "List public Slack channels in the workspace.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Max channels to return (default 20)" },
+      },
+    },
+  },
+  {
+    name: "slack_post_message",
+    description: "Post a message to a Slack channel on behalf of the user.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel: { type: "string", description: "Channel name (without #) or channel ID" },
+        text: { type: "string", description: "Message text to post" },
+      },
+      required: ["channel", "text"],
+    },
+  },
+];
+
+async function callSlackTool(name: string, args: Record<string, unknown>, userIdToken: string): Promise<string> {
+  await emitEvent("P9 Agent", "requesting STS token exchange", "Okta STS", `resource=Slack tool=${name}`, undefined, "auth");
+  const stsResult = await exchangeForSlackToken(userIdToken);
+  if (stsResult.kind === "interaction_required") {
+    await emitEvent("Okta STS", "interaction_required", "P9 Agent", "Slack not linked to Okta", undefined, "auth");
+    return `To use Slack, please link your Slack account with Okta first: [Authorize Slack → Okta](${stsResult.errorUri})\n\nAfter authorizing, return here and try again.`;
+  }
+  if (stsResult.kind === "error") {
+    await emitEvent("Okta STS", "STS exchange failed", "P9 Agent", stsResult.message, undefined, "error");
+    return `Slack authorization failed: ${stsResult.message}`;
+  }
+  const token = stsResult.accessToken;
+  const snippet = `${token.slice(0, 20)}…`;
+  await emitEvent("Okta STS", "Slack token obtained", "P9 Agent", `tool=${name}`, snippet, "token", token);
+
+  await emitEvent("P9 Agent", "calling tool", "Slack API", `tool=${name}`, undefined, "info");
+  try {
+    let data: unknown;
+    if (name === "slack_list_channels") {
+      const url = new URL("https://slack.com/api/conversations.list");
+      url.searchParams.set("limit", String(args.limit ?? 20));
+      url.searchParams.set("exclude_archived", "true");
+      const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${token}` } });
+      data = await res.json();
+    } else if (name === "slack_post_message") {
+      const res = await fetch("https://slack.com/api/chat.postMessage", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ channel: args.channel, text: args.text }),
+      });
+      data = await res.json();
+    } else {
+      return `Unknown Slack tool: ${name}`;
+    }
+    const body = data as Record<string, unknown>;
+    if (!body.ok) {
+      const errMsg = String(body.error ?? "unknown");
+      if (errMsg.includes("missing_scope")) {
+        await emitEvent("Okta STS", "bot token lacks chat:write", "Slack", "admin must add chat:write scope", undefined, "error");
+        return "The Slack bot token doesn't have `chat:write` scope. An Okta admin must add `chat:write` and `chat:write.public` to the Slack app's OAuth scopes in Okta Admin → Applications, then reinstall the app.";
+      }
+      throw new Error(`Slack API error: ${errMsg}`);
+    }
+    await emitEvent("Okta STS", "Slack token used", "Slack API", `tool=${name}`, undefined, "token");
+    await emitEvent("Slack API", "called tool", name, undefined, undefined, "info");
+    return JSON.stringify(data, null, 2);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await emitEvent("P9 Agent", "tool error", "Slack API", msg, undefined, "error");
+    return `Error: ${msg}`;
+  }
+}
+
+interface ToolDef {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+// Discover tools via GET /tools (no auth) — avoids eagerly fetching tokens for servers not needed.
+// P9 always attaches a real user's token to every tool call, so tools that require no scopes
+// (e.g. Finance's get_fiscal_summary, HR's get_headcount) are filtered out here — calling them
+// would be pointless given the user is already authenticated, and confusing in the event log.
+async function discoverToolsViaRest(serverUrl: string, label: string): Promise<ToolDef[]> {
+  console.log(serverUrl);
+  const resp = await fetch(`${serverUrl}/tools`);
+  if (!resp.ok) throw new Error(`Tool discovery failed for ${label}: ${resp.status}`);
+  const { tools } = await resp.json() as { tools: Array<{ name: string; description: string; inputSchema?: Record<string, unknown>; requiredScopes?: string[] }> };
+  const scopedTools = tools.filter((t) => (t.requiredScopes?.length ?? 0) > 0);
+  const skipped = tools.length - scopedTools.length;
+  await emitEvent("P9 Agent", "discovered tools", label, `count=${scopedTools.length}${skipped > 0 ? ` (${skipped} public tool(s) skipped)` : ""}`, undefined, "info");
+  return scopedTools.map((t) => ({
+    name: t.name,
+    description: t.description,
+    inputSchema: t.inputSchema ?? { type: "object", properties: {} },
+  }));
+}
+
+// Per-call MCP invocation: acquire scoped token → one-shot client → call tool → close
+async function callMcpTool(name: string, args: Record<string, unknown>, ctx: RequestContext, toolMap: DynamicToolMap): Promise<string> {
+  const server = toolMap.get(name);
+  if (!server) throw new Error(`Unknown tool: ${name}`);
+
+  const scopes = getScopesForTool(name, server.scopes);
+  const label = `${server.label} Server`;
+
+  let token: string;
+  try {
+    token = await getTokenForServer(server, scopes, ctx);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "XAA failed";
+    await emitEvent(label, "policy denied", name, msg, undefined, "error");
+    return `Access to "${name}" is not permitted for this user due to an Okta policy restriction.`;
+  }
+
+  await emitEvent("P9 Agent", "calling tool", label, `tool=${name} scopes=${scopes.join(",")}`, undefined, "info");
+
+  const sessionId = requestContext.getStore()?.sessionId;
+  const transport = new StreamableHTTPClientTransport(
+    new URL(`${server.url}/mcp`),
+    {
+      requestInit: {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "X-Pattern-Id": PATTERN_ID,
+          ...(sessionId ? { "X-Session-Id": sessionId } : {}),
+        },
+      },
+    }
+  );
+  const client = new Client({ name: "p9-agent", version: "1.0.0" });
+  await client.connect(transport);
+  try {
+    const result = await client.callTool({ name, arguments: args });
+    const content = result.content as { type: string; text: string }[];
+    return content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
+interface Message {
+  role: "user" | "assistant";
+  content: string;
+}
+
+const sessions = new Map<string, Message[]>();
+const seenTokenSessions = new Set<string>();
+
+function decodeJwtPayload(token: string): Record<string, unknown> {
+  try {
+    const b64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    return JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
+  } catch {
+    return {};
+  }
+}
+
+interface LLMOverrides { anthropicKey?: string; openaiKey?: string; litellmKey?: string; litellmBaseUrl?: string; litellmModel?: string; }
+
+type ToolExecutor = (name: string, args: Record<string, unknown>) => Promise<string>;
+
+async function* runAgentLoop(
+  userMessage: string,
+  history: Message[],
+  callTool: ToolExecutor,
+  tools: ToolDef[],
+  userName: string,
+  restrictionNote = "",
+  overrides?: LLMOverrides,
+  signal?: AbortSignal
+): AsyncGenerator<string> {
+  const messages: Message[] = [...history, { role: "user", content: userMessage }];
+  const isFirstMessage = history.length === 0;
+  const greetInstruction = isFirstMessage ? `Start your response by greeting ${userName} by name. ` : "";
+  const slackNote = SLACK_STS_RESOURCE ? " When slack tools are available, you can use them to post summaries or reports to Slack channels." : "";
+  const system = `${greetInstruction}You are a helpful internal assistant acting on behalf of ${userName}. Use the available tools to answer questions about employees, departments, budgets, and finances.${slackNote}${restrictionNote} Be concise and informative. When presenting lists of employees or departments, format them as readable markdown tables or structured lists with clear headings — never dump raw JSON.`;
+
+  if (overrides?.litellmKey && overrides?.litellmBaseUrl) {
+    yield* runOpenAI(messages, system, callTool, tools, overrides, signal);
+  } else if (overrides?.anthropicKey || process.env.ANTHROPIC_API_KEY) {
+    yield* runAnthropic(messages, system, callTool, tools, overrides, signal);
+  } else if (overrides?.openaiKey || process.env.OPENAI_API_KEY) {
+    yield* runOpenAI(messages, system, callTool, tools, overrides, signal);
+  } else {
+    yield "No LLM API key configured. Set ANTHROPIC_API_KEY or OPENAI_API_KEY.";
+  }
+}
+
+async function* runAnthropic(
+  messages: Message[],
+  system: string,
+  callTool: ToolExecutor,
+  tools: ToolDef[],
+  overrides?: LLMOverrides,
+  signal?: AbortSignal
+): AsyncGenerator<string> {
+  const anthropic = new Anthropic({ ...(overrides?.anthropicKey && { apiKey: overrides.anthropicKey }) });
+  const anthropicTools: Anthropic.Tool[] = tools.map((t) => ({
+    name: t.name,
+    description: t.description,
+    input_schema: t.inputSchema as Anthropic.Tool["input_schema"],
+  }));
+
+  let msgs: Anthropic.MessageParam[] = messages.map((m) => ({ role: m.role, content: m.content }));
+
+  while (true) {
+    if (signal?.aborted) return;
+    const response = await anthropic.messages.create({
+      model: process.env.ANTHROPIC_MODEL ?? "claude-opus-4-7",
+      max_tokens: 4096,
+      system,
+      messages: msgs,
+      tools: anthropicTools,
+    });
+
+    const textBlocks = response.content.filter((b): b is Anthropic.TextBlock => b.type === "text");
+    const toolBlocks = response.content.filter((b): b is Anthropic.ToolUseBlock => b.type === "tool_use");
+
+    if (textBlocks.length > 0) yield textBlocks.map((b) => b.text).join("");
+    if (response.stop_reason !== "tool_use" || toolBlocks.length === 0) break;
+
+    const toolResults: Anthropic.ToolResultBlockParam[] = [];
+    for (const tool of toolBlocks) {
+      const result = await callTool(tool.name, tool.input as Record<string, unknown>);
+      toolResults.push({ type: "tool_result", tool_use_id: tool.id, content: result });
+    }
+
+    await emitEvent("P9 Agent", "tool results ready", "LLM", "Data received from all the tools. Sent to LLM for processing.", undefined, "info");
+
+    msgs = [
+      ...msgs,
+      { role: "assistant", content: response.content },
+      { role: "user", content: toolResults },
+    ];
+  }
+}
+
+async function* runOpenAI(
+  messages: Message[],
+  system: string,
+  callTool: ToolExecutor,
+  tools: ToolDef[],
+  overrides?: LLMOverrides,
+  signal?: AbortSignal
+): AsyncGenerator<string> {
+  const openai = overrides?.litellmKey && overrides?.litellmBaseUrl
+    ? new OpenAI({ apiKey: overrides.litellmKey, baseURL: overrides.litellmBaseUrl })
+    : new OpenAI({ ...(overrides?.openaiKey && { apiKey: overrides.openaiKey }) });
+  const openaiTools: OpenAI.ChatCompletionTool[] = tools.map((t) => ({
+    type: "function" as const,
+    function: { name: t.name, description: t.description, parameters: t.inputSchema },
+  }));
+
+  let msgs: OpenAI.ChatCompletionMessageParam[] = [
+    { role: "system", content: system },
+    ...messages.map((m) => ({ role: m.role, content: m.content })),
+  ];
+
+  while (true) {
+    if (signal?.aborted) return;
+    const response = await openai.chat.completions.create({
+      model: overrides?.litellmModel || process.env.OPENAI_MODEL || "gpt-4o",
+      messages: msgs,
+      tools: openaiTools,
+    });
+
+    const choice = response.choices[0];
+    if (choice.message.content) yield choice.message.content;
+    if (choice.finish_reason !== "tool_calls" || !choice.message.tool_calls?.length) break;
+
+    const toolResults: OpenAI.ChatCompletionToolMessageParam[] = [];
+    for (const tc of choice.message.tool_calls) {
+      const args = JSON.parse(tc.function.arguments) as Record<string, unknown>;
+      const result = await callTool(tc.function.name, args);
+      toolResults.push({ role: "tool", tool_call_id: tc.id, content: result });
+    }
+
+    await emitEvent("P9 Agent", "tool results ready", "LLM", "Data received from all the tools. Sent to LLM for processing.", undefined, "info");
+
+    msgs = [...msgs, choice.message, ...toolResults];
+  }
+}
+
+// ── Express server ────────────────────────────────────────────────────────────
+
+const app = express();
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-LLM-Api-Key, X-LLM-Provider, X-LLM-Base-Url, X-LLM-Model, X-Slack-Token, X-Slack-Channel");
+  if (req.method === "OPTIONS") { res.sendStatus(200); return; }
+  next();
+});
+app.use(express.json());
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "p9-agent" });
+});
+
+app.get("/status", (_req, res) => {
+  res.json({
+    state: loadState,
+    servers: statusConnections,
+    fallbackReason: loadFallbackReason || undefined,
+    message: loadState === "loading"
+      ? "Fetching connections from Okta AI Agent Connections API..."
+      : loadState === "fallback"
+        ? `Using static env var config (${loadFallbackReason || "Okta API unavailable"})`
+        : `Loaded ${statusConnections.length} connection(s) from Okta`,
+  });
+});
+
+app.post("/refresh", async (_req, res) => {
+  await loadAgentConnections();
+  res.json({
+    state: loadState,
+    servers: statusConnections,
+    fallbackReason: loadFallbackReason || undefined,
+    message: loadState === "fallback"
+      ? `Using static env var config (${loadFallbackReason || "Okta API unavailable"})`
+      : `Loaded ${statusConnections.length} connection(s) from Okta`,
+  });
+});
+
+app.post("/chat", async (req, res) => {
+  const { message, session_id, viewer_session_id } = req.body as {
+    message: string;
+    session_id?: string;
+    viewer_session_id?: string;
+  };
+
+  if (!message) {
+    res.status(400).json({ error: "message required" });
+    return;
+  }
+
+  await requestContext.run({ sessionId: viewer_session_id }, () => handleChat(req, res, message, session_id));
+});
+
+async function handleChat(req: express.Request, res: express.Response, message: string, session_id?: string) {
+
+  const llmOverrides: LLMOverrides = {
+    anthropicKey: req.headers["x-llm-api-key"] && req.headers["x-llm-provider"] !== "openai" && req.headers["x-llm-provider"] !== "litellm"
+      ? String(req.headers["x-llm-api-key"]) : undefined,
+    openaiKey: req.headers["x-llm-api-key"] && req.headers["x-llm-provider"] === "openai"
+      ? String(req.headers["x-llm-api-key"]) : undefined,
+    litellmKey: req.headers["x-llm-api-key"] && req.headers["x-llm-provider"] === "litellm"
+      ? String(req.headers["x-llm-api-key"]) : undefined,
+    litellmBaseUrl: req.headers["x-llm-base-url"] ? String(req.headers["x-llm-base-url"]) : undefined,
+    litellmModel: req.headers["x-llm-model"] ? String(req.headers["x-llm-model"]) : undefined,
+  };
+
+  const authHeader = req.headers.authorization;
+  const userIdToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+
+  if (!userIdToken) {
+    await emitEvent("P9 Agent", "rejected request", "chat", "missing user ID token", undefined, "error");
+    res.status(401).json({ error: "User ID token required — log in first" });
+    return;
+  }
+
+  const sid = session_id ?? "default";
+  const history = sessions.get(sid) ?? [];
+  const claims = decodeJwtPayload(userIdToken);
+  const userName = (claims.name ?? claims.email ?? "User") as string;
+
+  if (!seenTokenSessions.has(sid)) {
+    seenTokenSessions.add(sid);
+    await emitEvent("P9 Agent", "user id_token received", "Okta", `user=${userName}`, undefined, "token", userIdToken);
+    if (loadState === "fallback") {
+      await emitEvent("P9 Agent", "fallback mode active", "Okta Connections API", `Okta API was unreachable at startup — using static env var config (${loadFallbackReason})`, undefined, "warn");
+    }
+  }
+
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.setHeader("Transfer-Encoding", "chunked");
+
+  const controller = new AbortController();
+  // req 'close' fires as soon as the request body is read, not when the response
+  // finishes — aborting on it kills the LLM call almost immediately on every
+  // request. res 'close' fires when the connection actually ends; writableEnded
+  // distinguishes a normal finish from a real client disconnect.
+  res.on("close", () => { if (!res.writableEnded) controller.abort(); });
+
+  try {
+    const ctx: RequestContext = { userIdToken, tokenCache: new Map() };
+
+    // Build dynamic tool map from Okta-discovered connections
+    const toolMap: DynamicToolMap = new Map();
+    const mcpTools: ToolDef[] = [];
+    try {
+      for (const server of discoveredServers) {
+        const serverTools = await discoverToolsViaRest(server.url, `${server.label} Server`);
+        for (const tool of serverTools) toolMap.set(tool.name, server);
+        mcpTools.push(...serverTools);
+      }
+      console.log(mcpTools);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Initialization error";
+      await emitEvent("P9 Agent", "initialization failed", "agent", msg, undefined, "error");
+      res.write(`Error: ${msg}`);
+      res.end();
+      return;
+    }
+
+    // Inactive connections were never added to discoveredServers; collect them so the LLM
+    // knows not to fabricate data for resources it has no tools for. Servers an Okta access
+    // policy denies are handled reactively in callMcpTool when a tool for them is actually called —
+    // minting tokens for every server up front would exchange XAA tokens for resources the
+    // request may never touch.
+    const inactiveServerLabels = statusConnections
+      .filter(c => !c.active && c.connectionType === "IDENTITY_ASSERTION_CUSTOM_AS")
+      .map(c => `${c.label} Server`);
+
+    const restrictionNote = inactiveServerLabels.length > 0
+      ? ` IMPORTANT: The following resources are currently unavailable: ${inactiveServerLabels.join(", ")}. ${inactiveServerLabels.join(" and ")} ${inactiveServerLabels.length === 1 ? "is" : "are"} inactive in Okta — no tools exist for ${inactiveServerLabels.length === 1 ? "it" : "them"}. Do NOT make up, estimate, or infer any data for unavailable resources. Always call available tools to retrieve whatever partial results you can. After presenting the data you were able to retrieve, add a clear note that the unavailable resource(s) could not be accessed because the Okta connection is inactive.`
+      : "";
+
+    const tools: ToolDef[] = [...mcpTools, ...(SLACK_STS_RESOURCE ? SLACK_TOOLS : [])];
+
+    const callTool: ToolExecutor = (name, args) => {
+      if (controller.signal.aborted) return Promise.resolve("cancelled");
+      if (name.startsWith("slack_")) return callSlackTool(name, args, userIdToken);
+      return callMcpTool(name, args, ctx, toolMap);
+    };
+
+    let fullResponse = "";
+    for await (const chunk of runAgentLoop(message, history, callTool, tools, userName, restrictionNote, llmOverrides, controller.signal)) {
+      fullResponse += chunk;
+      res.write(chunk);
+    }
+
+    const newHistory: Message[] = [
+      ...history,
+      { role: "user", content: message },
+      { role: "assistant", content: fullResponse },
+    ];
+    sessions.set(sid, newHistory.slice(-20));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    console.error("[chat error]", msg);
+    res.write("I encountered an unexpected error. Please try again.");
+  }
+
+  res.end();
+}
+
+app.listen(PORT, () => {
+  console.log(`P9 agent listening on :${PORT}`);
+  emitEvent("P9 Agent", "started", "event-bus", `port=${PORT}`, undefined, "info");
+  loadAgentConnections().catch((err) => console.warn("Connection load failed:", err));
+});

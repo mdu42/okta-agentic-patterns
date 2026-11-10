@@ -41,6 +41,7 @@ export default async function PatternPage({ params }: Props) {
     p5: "p5_id_token",
     p6: "p6_id_token",
     p7: "p7_id_token",
+    p9: "p9_id_token",    
   };
   const cookieName = TOKEN_COOKIES[id];
   const userToken = cookieName ? (cookieStore.get(cookieName)?.value ?? null) : null;

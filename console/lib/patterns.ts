@@ -1,4 +1,4 @@
-export type PatternId = "p1" | "p2" | "p3" | "p4" | "p5" | "p6" | "p7" | "p8";
+export type PatternId = "p1" | "p2" | "p3" | "p4" | "p5" | "p6" | "p7" | "p8"| "p9";
 
 export interface McpServerDef {
   name: string;   // display name shown in the UI
@@ -266,8 +266,52 @@ export const PATTERNS: Pattern[] = [
           { label: "Gemini / Vertex AI", url: "https://0lqdrzz0a2tp5gv9.public.blob.vercel-storage.com/videos/gemini-vertex" },
         ],
       },
+      {
+        label: "AWS Bedrock Agents",
+        videoUrls: [
+          { label: "AWS Agentcore", url: "https://main.daatq7elbigcu.amplifyapp.com" },
+        ],
+      },      
     ],
   },
+  {
+    id: "p9",
+    title: "1st Party Agent - XAA - CrossOrg",
+    subtitle: "1st party agent → Okta-protected resource via native XAA",
+    description:
+      "A first-party agent registered as an Okta AI Agent principal performs native Cross App Access (XAA). The agent holds its own private key and exchanges tokens directly with Okta to act on behalf of the logged-in user.",
+    agentType: "1st Party",
+    authFlow: "XAA Native (ID-JAG)",
+    badge: "XAA",
+    requiresAdapter: false,
+    agentUrl: process.env.NEXT_PUBLIC_P9_AGENT_URL ?? "http://localhost:3900",
+    agentHealthUrl: process.env.P9_AGENT_INTERNAL_URL ?? process.env.NEXT_PUBLIC_P9_AGENT_URL ?? "http://localhost:3900",
+    rightPanel: "chat",
+    requiresUserToken: true,
+    hasAgentStatus: true,
+    buildStatus: "done",
+    mcpServers: [
+      {
+        name: "HR Server MCP",
+        actor: "HR Server",
+        tools: ["list_employees", "get_employee", "get_org_chart", "list_departments", "search_employees", "update_employee_title"],
+        resourceId: "aus11q3f89dHdY0jx1d8",
+      },
+      {
+        name: "Finance Server MCP",
+        actor: "Finance Server",
+        tools: ["get_budget", "list_invoices", "get_expense_report", "list_cost_centers", "get_invoice"],
+        resourceId: "aus11q3a2k8DT8bws1d8",
+      },      
+      {
+        name: "Inventory MCP",
+        actor: "Inventory Server",
+        tools: ["get_product_catalog", "check_stock", "get_product_details", "get_order_status", "list_categories"],
+        resourceId: "aus11q3j37iXrPpcL1d8",
+      },
+    ],
+  },
+
 ];
 
 export function getPattern(id: string): Pattern | undefined {

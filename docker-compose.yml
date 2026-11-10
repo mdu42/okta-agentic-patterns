@@ -52,6 +52,7 @@ services:
       # Internal URLs for server-side health checks — agents running on host are unreachable at localhost from inside Docker
       P2_AGENT_INTERNAL_URL: http://p2-agent:3200
       P3_AGENT_INTERNAL_URL: http://p3-agent:3300
+      P9_AGENT_INTERNAL_URL: http://p9-agent:3900
       P6_AGENT_INTERNAL_URL: http://p6-agent:3600
       P1_AGENT_INTERNAL_URL: http://hr-server:3101
       MCP_ADAPTER_URL: ${MCP_ADAPTER_URL:-}
@@ -100,7 +101,7 @@ services:
 
   finance-server:
     build: ./shared/mcp-servers/finance
-    profiles: [p1, p3, p6, p7]
+    profiles: [p1, p3, p6, p7, p9]
     ports:
       - "3102:3102"
     environment:
@@ -135,6 +136,44 @@ services:
     networks:
       - internal
       - shared
+
+  inventory-server-ext:
+    build: ./shared/mcp-servers/inventory
+    profiles: [p2, p5, p9]
+    ports:
+      - "3104:3104"
+    environment:
+      PORT: 3104
+      EVENT_BUS_URL: http://event-bus:4000
+      OKTA_ISSUER: https://${OKTA_DOMAIN_EXT}/oauth2/${INVENTORY_EXT_AUTHZ_SERVER_ID:-default}
+      OKTA_AUDIENCE: ${INVENTORY_EXT_RESOURCE_AUDIENCE:-api://inventory-resource}
+      PATTERN_IDS: p2,p5,p9
+      DEMO_THEME: ${DEMO_THEME:-default}
+    depends_on:
+      - event-bus
+    logging: *default-logging
+    networks:
+      - internal
+      - shared
+
+  hr-server-ext:
+    build: ./shared/mcp-servers/hr
+    profiles: [p9]
+    ports:
+      - "3105:3105"
+    environment:
+      PORT: 3105
+      EVENT_BUS_URL: http://event-bus:4000
+      OKTA_ISSUER: https://${OKTA_DOMAIN_EXT}/oauth2/${HR_EXT_AUTHZ_SERVER_ID:-default}
+      OKTA_AUDIENCE: ${HR_EXT_RESOURCE_AUDIENCE:-api://default}
+      PATTERN_IDS: p9
+      DEMO_THEME: ${DEMO_THEME:-default}
+    depends_on:
+      - event-bus
+    logging: *default-logging
+    networks:
+      - internal
+      - shared            
 
 
   # ── Pattern 2: 3rd Party → Single Resource ───────────────────────────────────
@@ -401,6 +440,49 @@ services:
       - event-bus
       - hr-server
       - finance-server
+    logging: *default-logging
+    networks:
+      - internal
+
+  # ── Pattern 3: 1st Party XAA Native ─────────────────────────────────────────
+  p9-agent:
+    build: ./patterns/p9-first-party-xaa-crossorg/agent
+    profiles: [p9]
+    ports:
+      - "${P9_PORT:-3900}:3900"
+    environment:
+      PORT: 3900
+      EVENT_BUS_URL: http://event-bus:4000
+      OKTA_DOMAIN: ${OKTA_DOMAIN:-}
+      OKTA_ISSUER: ${OKTA_ISSUER}
+      # Deliberately NOT set here: the agent's client-assertion identity must fall back to
+      # OKTA_AI_AGENT_ID. The shared okta-demo-p3-p4-shared app (P3_OKTA_CLIENT_ID) is
+      # token_endpoint_auth_method=client_secret_basic with no JWKS — a client_assertion
+      # signed as that client_id is rejected with client_assertion_jwks_not_configured.
+      # OKTA_CLIENT_ID: ${P3_OKTA_CLIENT_ID:-}
+      OKTA_AI_AGENT_ID: ${P3_OKTA_AI_AGENT_ID:-}
+      OKTA_PRIVATE_KEY: ${P3_OKTA_PRIVATE_KEY:-}
+      OKTA_CLIENT_SECRET: ${P3_OKTA_CLIENT_SECRET:-}
+      PROTECTED_API_URL: http://hr-server-ext:3105
+      FINANCE_API_URL: http://finance-server:3102
+      # Audience strings: link Docker-internal URLs to Okta connections (auth config comes from Connections API)
+      HR_RESOURCE_AUDIENCE: ${HR_EXT_RESOURCE_AUDIENCE:-}
+      FINANCE_RESOURCE_AUDIENCE: ${FINANCE_RESOURCE_AUDIENCE:-}
+      # Auth server IDs: only used as static fallback when Okta Connections API is unreachable
+      HR_AUTHZ_SERVER_ID: ${HR_EXT_AUTHZ_SERVER_ID:-}
+      FINANCE_AUTHZ_SERVER_ID: ${FINANCE_AUTHZ_SERVER_ID:-}
+      OKTA_API_TOKEN: ${OKTA_API_TOKEN:-}
+      SLACK_STS_RESOURCE: ${P4_SLACK_STS_RESOURCE:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      HR_CLIENT_ID: ${HR_EXT_CLIENT_ID:-}
+      HR_CLIENT_SECRET: ${HR_EXT_CLIENT_SECRET:-}
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+    depends_on:
+      - inventory-server-ext
+      - hr-server-ext
+      - finance-server
+      - event-bus
     logging: *default-logging
     networks:
       - internal

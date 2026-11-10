@@ -18,6 +18,7 @@ const diagrams: Record<PatternId, React.ReactNode> = {
   p6: <P6Diagram />,
   p7: <P7Diagram />,
   p8: null,
+  p9: null
 };
 
 export function FlowDiagram({ patternId, animate = false, fill = false, mission = 2 }: FlowDiagramProps) {

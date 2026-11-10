@@ -1162,7 +1162,7 @@ function UserLoginGate({ pattern, active, viewerSessionId }: { pattern: Pattern;
     return (
       <div className="flex h-full items-center justify-center rounded-xl border border-gray-700/50 bg-gray-800/60 p-6 text-center">
         <div>
-          <p className="mb-2 text-sm text-slate-500">Pattern {pattern.id.toUpperCase()} not running</p>
+          <p className="mb-2 text-sm text-slate-500">Pattern {pattern.id.toUpperCase()} not running {pattern.agentHealthUrl}</p>
           <code className="text-xs text-slate-600">
             docker compose --profile {pattern.id} up
           </code>
