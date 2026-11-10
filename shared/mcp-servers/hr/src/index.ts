@@ -1,6 +1,6 @@
 import express from "express";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
+import { McpServer } from "@modelcontextprotocol/server";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { z } from "zod";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -103,37 +103,28 @@ const PUBLIC_TOOLS = new Set(["get_headcount"]);
 function createMcpServer(patternIds: string[]) {
   const server = new McpServer({ name: "hr-resource-server", version: "1.0.0" });
 
-  server.tool("get_headcount", "Get total employee count by department. No authentication required.", {},
-    async () => {
+  server.registerTool("get_headcount", { description: "Get total employee count by department. No authentication required.", inputSchema: z.object({}) }, async () => {
       await emitEvent("HR Server", "called tool", "get_headcount", "public tool — no auth required", undefined, "info", patternIds);
       const counts = getData().departments.map((d) => ({ department: d.name, headCount: d.headcount }));
       return { content: [{ type: "text", text: JSON.stringify(counts, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool("list_employees", "List all employees. Optionally filter by department.",
-    { department: z.string().optional().describe("Filter by department name") },
-    async ({ department }) => {
+  server.registerTool("list_employees", { description: "List all employees. Optionally filter by department.", inputSchema: z.object({ department: z.string().optional().describe("Filter by department name") }) }, async ({ department }) => {
       await emitEvent("HR Server", "called tool", "list_employees", department ? `dept=${department}` : undefined, undefined, "info", patternIds);
       const result = department
         ? getData().employees.filter((e) => e.department.toLowerCase() === department.toLowerCase())
         : getData().employees;
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool("get_employee", "Get details for a specific employee by ID.",
-    { employee_id: z.string().describe("Employee ID (e.g. e001)") },
-    async ({ employee_id }) => {
+  server.registerTool("get_employee", { description: "Get details for a specific employee by ID.", inputSchema: z.object({ employee_id: z.string().describe("Employee ID (e.g. e001)") }) }, async ({ employee_id }) => {
       await emitEvent("HR Server", "called tool", "get_employee", `id=${employee_id}`, undefined, "info", patternIds);
       const emp = getData().employees.find((e) => e.id === employee_id);
       if (!emp) return { content: [{ type: "text", text: `Employee ${employee_id} not found` }] };
       return { content: [{ type: "text", text: JSON.stringify(emp, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool("get_org_chart", "Get the organizational reporting hierarchy.", {},
-    async () => {
+  server.registerTool("get_org_chart", { description: "Get the organizational reporting hierarchy.", inputSchema: z.object({}) }, async () => {
       await emitEvent("HR Server", "called tool", "get_org_chart", undefined, undefined, "info", patternIds);
       const { employees } = getData();
       const chart = employees.map((e) => ({
@@ -141,46 +132,37 @@ function createMcpServer(patternIds: string[]) {
         reportsTo: e.manager ? employees.find((m) => m.id === e.manager)?.name ?? null : null,
       }));
       return { content: [{ type: "text", text: JSON.stringify(chart, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool("list_departments", "List all departments with headcount.", {},
-    async () => {
+  server.registerTool("list_departments", { description: "List all departments with headcount.", inputSchema: z.object({}) }, async () => {
       await emitEvent("HR Server", "called tool", "list_departments", undefined, undefined, "info", patternIds);
       const { employees, departments } = getData();
       const result = departments.map((d) => ({
         ...d, head: employees.find((e) => e.id === d.head)?.name ?? d.head,
       }));
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool("search_employees", "Search employees by name or title.",
-    { query: z.string().describe("Search query") },
-    async ({ query }) => {
+  server.registerTool("search_employees", { description: "Search employees by name or title.", inputSchema: z.object({ query: z.string().describe("Search query") }) }, async ({ query }) => {
       await emitEvent("HR Server", "called tool", "search_employees", `q=${query}`, undefined, "info", patternIds);
       const q = query.toLowerCase();
       const result = getData().employees.filter(
         (e) => e.name.toLowerCase().includes(q) || e.title.toLowerCase().includes(q)
       );
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool("update_employee_title", "Update an employee's job title.",
-    {
+  server.registerTool("update_employee_title", { description: "Update an employee's job title.", inputSchema: z.object({
       employee_id: z.string().describe("Employee ID (e.g. e001)"),
       new_title: z.string().describe("New job title"),
-    },
-    async ({ employee_id, new_title }) => {
+    }) }, async ({ employee_id, new_title }) => {
       await emitEvent("HR Server", "called tool", "update_employee_title", `id=${employee_id} title=${new_title}`, undefined, "info", patternIds);
       const emp = getData().employees.find((e) => e.id === employee_id);
       if (!emp) return { content: [{ type: "text", text: `Employee ${employee_id} not found` }] };
       const oldTitle = emp.title;
       emp.title = new_title;
       return { content: [{ type: "text", text: `Updated ${emp.name}: "${oldTitle}" → "${new_title}"` }] };
-    }
-  );
+  });
 
   return server;
 }
@@ -305,7 +287,7 @@ app.all("/mcp", async (req, res) => {
   }
 
   const server = createMcpServer(emitPatterns ?? PATTERN_IDS);
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 
   res.on("close", () => transport.close());
   await server.connect(transport);

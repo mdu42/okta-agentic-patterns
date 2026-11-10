@@ -1,6 +1,6 @@
 import express from "express";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
+import { McpServer } from "@modelcontextprotocol/server";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { z } from "zod";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -117,67 +117,51 @@ async function validateToken(authHeader: string | undefined, scopePatternIds?: s
 function createMcpServer(patternIds: string[]) {
   const server = new McpServer({ name: "finance-resource-server", version: "1.0.0" });
 
-  server.tool("get_fiscal_summary", "Get high-level fiscal summary (total budget vs spend). No authentication required.", {},
-    async () => {
+  server.registerTool("get_fiscal_summary", { description: "Get high-level fiscal summary (total budget vs spend). No authentication required.", inputSchema: z.object({}) }, async () => {
       await emitEvent("Finance Server", "called tool", "get_fiscal_summary", "public tool — no auth required", undefined, "info", patternIds);
       const { budgets } = getData();
       const totalBudget = budgets.reduce((s, b) => s + b.total, 0);
       const totalSpent = budgets.reduce((s, b) => s + b.spent, 0);
       const summary = { totalBudget, totalSpent, remaining: totalBudget - totalSpent, utilizationPct: Math.round((totalSpent / totalBudget) * 100) };
       return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool("get_budget", "Get budget for a department.",
-    { department: z.string().describe("Department name") },
-    async ({ department }) => {
+  server.registerTool("get_budget", { description: "Get budget for a department.", inputSchema: z.object({ department: z.string().describe("Department name") }) }, async ({ department }) => {
       await emitEvent("Finance Server", "called tool", "get_budget", `dept=${department}`, undefined, "info", patternIds);
       const budget = getData().budgets.find((b) => b.department.toLowerCase() === department.toLowerCase());
       if (!budget) return { content: [{ type: "text", text: `No budget found for ${department}` }] };
       return { content: [{ type: "text", text: JSON.stringify(budget, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool("list_invoices", "List invoices. Optionally filter by status.",
-    {
+  server.registerTool("list_invoices", { description: "List invoices. Optionally filter by status.", inputSchema: z.object({
       status: z.enum(["paid", "pending", "all"]).optional().describe("Filter by payment status"),
-    },
-    async ({ status }) => {
+    }) }, async ({ status }) => {
       await emitEvent("Finance Server", "called tool", "list_invoices", `status=${status ?? "all"}`, undefined, "info", patternIds);
       let result = getData().invoices;
       if (status && status !== "all") result = result.filter((i) => i.status === status);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool("get_expense_report", "Get a summary expense report across all departments.",
-    { year: z.number().optional().describe("Fiscal year (default 2025)") },
-    async ({ year = 2025 }) => {
+  server.registerTool("get_expense_report", { description: "Get a summary expense report across all departments.", inputSchema: z.object({ year: z.number().optional().describe("Fiscal year (default 2025)") }) }, async ({ year = 2025 }) => {
       await emitEvent("Finance Server", "called tool", "get_expense_report", `year=${year}`, undefined, "info", patternIds);
       const filtered = getData().budgets.filter((b) => b.fiscalYear === String(year));
       const total = filtered.reduce((s, b) => s + b.total, 0);
       const spent = filtered.reduce((s, b) => s + b.spent, 0);
       const report = { year, totalBudget: total, totalSpent: spent, remaining: total - spent, utilizationPct: Math.round((spent / total) * 100), byDepartment: filtered };
       return { content: [{ type: "text", text: JSON.stringify(report, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool("list_cost_centers", "List all cost centers with YTD spend.", {},
-    async () => {
+  server.registerTool("list_cost_centers", { description: "List all cost centers with YTD spend.", inputSchema: z.object({}) }, async () => {
       await emitEvent("Finance Server", "called tool", "list_cost_centers", undefined, undefined, "info", patternIds);
       return { content: [{ type: "text", text: JSON.stringify(getData().costCenters, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool("get_invoice", "Get details for a specific invoice by ID.",
-    { invoice_id: z.string().describe("Invoice ID (e.g. inv-001)") },
-    async ({ invoice_id }) => {
+  server.registerTool("get_invoice", { description: "Get details for a specific invoice by ID.", inputSchema: z.object({ invoice_id: z.string().describe("Invoice ID (e.g. inv-001)") }) }, async ({ invoice_id }) => {
       await emitEvent("Finance Server", "called tool", "get_invoice", `id=${invoice_id}`, undefined, "info", patternIds);
       const inv = getData().invoices.find((i) => i.id === invoice_id);
       if (!inv) return { content: [{ type: "text", text: `Invoice ${invoice_id} not found` }] };
       return { content: [{ type: "text", text: JSON.stringify(inv, null, 2) }] };
-    }
-  );
+  });
 
   return server;
 }
@@ -295,7 +279,7 @@ app.all("/mcp", async (req, res) => {
   }
 
   const server = createMcpServer(emitPatterns ?? PATTERN_IDS);
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 
   res.on("close", () => transport.close());
   await server.connect(transport);

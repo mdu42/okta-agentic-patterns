@@ -1,6 +1,6 @@
 import express from "express";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
+import { McpServer } from "@modelcontextprotocol/server";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { z } from "zod";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -98,38 +98,24 @@ async function validateToken(authHeader: string | undefined): Promise<TokenClaim
 function createMcpServer() {
   const server = new McpServer({ name: "inventory-resource-server", version: "1.0.0" });
 
-  server.tool(
-    "get_product_catalog",
-    "Browse the product catalog. No authentication required.",
-    { category: z.string().optional().describe("Filter by category") },
-    async ({ category }) => {
+  server.registerTool("get_product_catalog", { description: "Browse the product catalog. No authentication required.", inputSchema: z.object({ category: z.string().optional().describe("Filter by category") }) }, async ({ category }) => {
       await emitEvent("Inventory Server", "called tool", "get_product_catalog", category ? `category=${category}` : "all", undefined, "info");
       const result = category
         ? getData().products.filter((p) => p.category.toLowerCase() === category.toLowerCase())
         : getData().products;
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool(
-    "check_stock",
-    "Check stock availability for a product SKU.",
-    { sku: z.string().describe("Product SKU") },
-    async ({ sku }) => {
+  server.registerTool("check_stock", { description: "Check stock availability for a product SKU.", inputSchema: z.object({ sku: z.string().describe("Product SKU") }) }, async ({ sku }) => {
       await emitEvent("Inventory Server", "called tool", "check_stock", `sku=${sku}`, undefined, "info");
       const inv = getData().inventory.find((i) => i.sku.toLowerCase() === sku.toLowerCase());
       if (!inv) return { content: [{ type: "text", text: `SKU ${sku} not found` }] };
       const available = inv.inStock - inv.reserved;
       const result = { ...inv, available };
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool(
-    "get_product_details",
-    "Get full product information including live stock level.",
-    { sku: z.string().describe("Product SKU") },
-    async ({ sku }) => {
+  server.registerTool("get_product_details", { description: "Get full product information including live stock level.", inputSchema: z.object({ sku: z.string().describe("Product SKU") }) }, async ({ sku }) => {
       await emitEvent("Inventory Server", "called tool", "get_product_details", `sku=${sku}`, undefined, "info");
       const { products, inventory } = getData();
       const product = products.find((p) => p.sku.toLowerCase() === sku.toLowerCase());
@@ -142,26 +128,16 @@ function createMcpServer() {
           : null,
       };
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool(
-    "get_order_status",
-    "Get the status of an order by order ID.",
-    { order_id: z.string().describe("Order ID") },
-    async ({ order_id }) => {
+  server.registerTool("get_order_status", { description: "Get the status of an order by order ID.", inputSchema: z.object({ order_id: z.string().describe("Order ID") }) }, async ({ order_id }) => {
       await emitEvent("Inventory Server", "called tool", "get_order_status", `id=${order_id}`, undefined, "info");
       const order = getData().orders.find((o) => o.orderId.toLowerCase() === order_id.toLowerCase());
       if (!order) return { content: [{ type: "text", text: `Order ${order_id} not found` }] };
       return { content: [{ type: "text", text: JSON.stringify(order, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool(
-    "list_categories",
-    "List all product categories with product counts.",
-    {},
-    async () => {
+  server.registerTool("list_categories", { description: "List all product categories with product counts.", inputSchema: z.object({}) }, async () => {
       await emitEvent("Inventory Server", "called tool", "list_categories", undefined, undefined, "info");
       const { categories, products } = getData();
       const result = categories.map((cat) => ({
@@ -169,18 +145,13 @@ function createMcpServer() {
         productCount: products.filter((p) => p.category === cat).length,
       }));
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-    }
-  );
+  });
 
-  server.tool(
-    "update_stock",
-    "Add units to the inventory for a product SKU. Requires inventory:write scope.",
-    {
+  server.registerTool("update_stock", { description: "Add units to the inventory for a product SKU. Requires inventory:write scope.", inputSchema: z.object({
       sku: z.string().describe("Product SKU"),
       quantity_to_add: z.number().int().positive().describe("Units to add"),
       reason: z.string().optional().describe("Reason for the update"),
-    },
-    async ({ sku, quantity_to_add, reason }) => {
+    }) }, async ({ sku, quantity_to_add, reason }) => {
       const inv = getData().inventory.find((i) => i.sku.toLowerCase() === sku.toLowerCase());
       if (!inv) return { content: [{ type: "text", text: `SKU ${sku} not found` }] };
       const before = inv.inStock;
@@ -188,8 +159,7 @@ function createMcpServer() {
       await emitEvent("Inventory Server", "updated stock", `sku=${sku}`,
         `${before} → ${inv.inStock}${reason ? ` (${reason})` : ""}`, undefined, "info");
       return { content: [{ type: "text", text: JSON.stringify({ sku, before, after: inv.inStock, quantity_added: quantity_to_add }) }] };
-    }
-  );
+  });
 
   return server;
 }
@@ -309,7 +279,7 @@ app.all("/mcp", async (req, res) => {
   }
 
   const server = createMcpServer();
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 
   res.on("close", () => transport.close());
   await server.connect(transport);
